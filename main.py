@@ -12,7 +12,11 @@ from telegram.ext import (
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import (
+    MessageMediaPhoto, MessageMediaDocument,
+    DocumentAttributeVideo, DocumentAttributeFilename,
+    InputPeerChannel
+)
 
 from database import (
     init_db, upsert_user,
@@ -42,8 +46,8 @@ active_clients = {}
 
 TG_LINK_RE = re.compile(
     r"(?:https?://)?t\.me/"
-    r"(?:(?P<username>[a-zA-Z0-9_]+)/(?P<msg_id>\d+)|"
-    r"c/(?P<channel_id>\d+)/(?P<msg_id2>\d+))"
+    r"(?:c/(?P<channel_id>\d+)/(?P<msg_id2>\d+)|"
+    r"(?P<username>[a-zA-Z0-9_]+)/(?P<msg_id>\d+))"
 )
 
 
@@ -78,6 +82,29 @@ def is_sticker_doc(doc):
         for attr in getattr(doc, "attributes", [])
     )
     return has_stickerset or "sticker" in mime
+
+
+def get_video_attributes(doc):
+    """
+    Ambil DocumentAttributeVideo dari dokumen asli.
+    Digunakan untuk mempertahankan dimensi video saat re-upload.
+    """
+    if doc is None:
+        return None
+    for attr in getattr(doc, "attributes", []):
+        if isinstance(attr, DocumentAttributeVideo):
+            return attr
+    return None
+
+
+def get_file_name(doc):
+    """Ambil nama file dari atribut dokumen."""
+    if doc is None:
+        return None
+    for attr in getattr(doc, "attributes", []):
+        if isinstance(attr, DocumentAttributeFilename):
+            return attr.file_name
+    return None
 
 
 def main_keyboard(uid):
@@ -115,6 +142,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
     client = build_client(api_id, api_hash, string_session)
     await client.start()
 
+    # ── .dl HANDLER ──────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.dl$"))
     async def dl_handler(event):
         if not is_subscribed(user_id):
@@ -126,6 +154,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
         replied = await event.get_reply_message()
         if not replied or not replied.media:
             return
+
         sender = await replied.get_sender()
         if sender:
             first   = getattr(sender, "first_name", "") or ""
@@ -138,35 +167,105 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
         chat_title = escape_md(getattr(chat, "title", None) or "Private Chat")
         caption    = f"📥 **Dari:** {mention}\n💬 **Chat:** {chat_title}"
 
-        if not is_no_forward(replied):
+        # Kirim notif status downloading
+        status_msg = await client.send_message("me", "⏳ Sedang mendownload media...")
+
+        # Jika BUKAN view-once dan BUKAN restricted → coba forward
+        is_view_once_media = bool(getattr(replied.media, "ttl_seconds", None))
+        if not is_view_once_media and not is_no_forward(replied):
             try:
                 await client.forward_messages("me", replied)
-                await client.send_message("me", caption, parse_mode="markdown")
-                return
+                await status_msg.edit(caption, parse_mode="markdown")
+                return  # ✔️ selesai, tidak perlu download manual
             except Exception:
-                pass
+                pass  # fallback ke download manual
 
+        # Download manual (view-once / restricted / forward gagal)
         try:
             media_bytes = await client.download_media(replied.media, bytes)
-        except Exception:
+        except Exception as e:
+            await status_msg.edit(f"❌ Gagal mendownload: `{e}`")
             return
         if not media_bytes:
+            await status_msg.delete()
             return
-        file_obj = io.BytesIO(media_bytes)
-        if isinstance(replied.media, MessageMediaPhoto):
-            file_obj.name = "photo.jpg"
-        else:
-            fname = "media.mp4"
-            try:
-                for attr in replied.media.document.attributes:
-                    if hasattr(attr, "file_name") and attr.file_name:
-                        fname = attr.file_name
-                        break
-            except Exception:
-                pass
-            file_obj.name = fname
-        await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
 
+        file_obj = io.BytesIO(media_bytes)
+
+        if isinstance(replied.media, MessageMediaPhoto):
+            # Foto
+            file_obj.name = "photo.jpg"
+            await status_msg.delete()
+            await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
+
+        elif isinstance(replied.media, MessageMediaDocument):
+            doc  = replied.media.document
+            mime = getattr(doc, "mime_type", "") or ""
+
+            if is_sticker_doc(doc):
+                # Stiker
+                if "webp" in mime:
+                    file_obj.name = "sticker.webp"
+                elif "tgsticker" in mime or "application/x-tgsticker" in mime:
+                    file_obj.name = "sticker.tgs"
+                elif "video" in mime:
+                    file_obj.name = "sticker.webm"
+                else:
+                    file_obj.name = "sticker.webp"
+                await status_msg.delete()
+                await client.send_file("me", file=file_obj, force_document=False)
+
+            elif "video" in mime or "mp4" in mime:
+                # ⚠️ VIDEO: pakai atribut asli untuk pertahankan dimensi (aspect ratio)
+                video_attr = get_video_attributes(doc)
+                fname = get_file_name(doc) or "video.mp4"
+                file_obj.name = fname
+
+                send_attrs = []
+                if video_attr:
+                    # Buat atribut baru tanpa round_message agar tidak jadi video bulat
+                    send_attrs = [DocumentAttributeVideo(
+                        duration=video_attr.duration,
+                        w=video_attr.w,
+                        h=video_attr.h,
+                        supports_streaming=True,
+                        round_message=False,
+                    )]
+
+                await status_msg.delete()
+                await client.send_file(
+                    "me",
+                    file=file_obj,
+                    caption=caption,
+                    parse_mode="markdown",
+                    attributes=send_attrs if send_attrs else None,
+                    allow_cache=False,
+                )
+
+            else:
+                # Dokumen / audio / dll
+                fname = get_file_name(doc) or "document"
+                if "." not in fname:
+                    ext_map = {
+                        "audio/mpeg": ".mp3",
+                        "audio/ogg": ".ogg",
+                        "application/pdf": ".pdf",
+                        "video/webm": ".webm",
+                        "image/gif": ".gif",
+                    }
+                    fname += ext_map.get(mime, "")
+                file_obj.name = fname
+                await status_msg.delete()
+                await client.send_file(
+                    "me", file=file_obj,
+                    caption=caption, parse_mode="markdown",
+                    force_document=False, allow_cache=False,
+                )
+        else:
+            await status_msg.delete()
+            await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
+
+    # ── .copy HANDLER ─────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.copy\s+(https?://t\.me/\S+)$"))
     async def copy_handler(event):
         if not is_subscribed(user_id):
@@ -180,50 +279,76 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             await client.send_message("me", "❌ Link tidak valid. Gunakan format: `.copy https://t.me/channel/123`")
             return
 
-        username_part   = m.group("username")
-        msg_id_part     = m.group("msg_id")
         channel_id_part = m.group("channel_id")
         msg_id2_part    = m.group("msg_id2")
+        username_part   = m.group("username")
+        msg_id_part     = m.group("msg_id")
 
-        if username_part and msg_id_part:
-            channel_ref = username_part
-            msg_id = int(msg_id_part)
-        elif channel_id_part and msg_id2_part:
-            channel_ref = int(channel_id_part)
+        if channel_id_part and msg_id2_part:
+            # Format t.me/c/CHANNEL_ID/MSG_ID — private/restricted channel
+            # WAJIB pakai InputPeerChannel agar Telethon bisa resolve
+            try:
+                channel_entity = await client.get_entity(InputPeerChannel(
+                    channel_id=int(channel_id_part),
+                    access_hash=0  # Telethon akan update access_hash otomatis dari cache
+                ))
+            except Exception:
+                # Fallback: coba join/akses lewat PeerChannel
+                try:
+                    from telethon.tl.types import PeerChannel
+                    channel_entity = await client.get_entity(PeerChannel(int(channel_id_part)))
+                except Exception as e:
+                    await client.send_message(
+                        "me",
+                        f"❌ Gagal mengakses channel `{channel_id_part}`.\n"
+                        f"Pastikan akun kamu sudah *bergabung* ke channel tersebut.\n\nError: `{e}`"
+                    )
+                    return
             msg_id = int(msg_id2_part)
+        elif username_part and msg_id_part:
+            # Format t.me/username/MSG_ID — public channel
+            channel_entity = username_part
+            msg_id = int(msg_id_part)
         else:
             await client.send_message("me", "❌ Format link tidak dikenali.")
             return
 
-        status_msg = await client.send_message("me", "⏳ Mengambil pesan...")
+        status_msg = await client.send_message("me", "⏳ Sedang mengambil pesan...")
 
         try:
-            msg = await client.get_messages(channel_ref, ids=msg_id)
+            msg = await client.get_messages(channel_entity, ids=msg_id)
         except Exception as e:
-            await status_msg.edit(f"❌ Gagal mengambil pesan: `{e}`")
+            await status_msg.edit(
+                f"❌ Gagal mengambil pesan: `{e}`\n\n"
+                f"Pastikan akun kamu sudah *bergabung* ke channel tersebut."
+            )
             return
 
         if msg is None:
             await status_msg.edit("❌ Pesan tidak ditemukan.")
             return
 
-        await status_msg.delete()
-
+        # Teks saja
         if not msg.media:
             text_content = msg.text or msg.message or ""
             if text_content:
-                await client.send_message("me", f"📋 **Dari channel:**\n\n{text_content}", parse_mode="markdown")
+                await status_msg.edit(f"📋 **Dari channel:**\n\n{text_content}", parse_mode="markdown")
             else:
-                await client.send_message("me", "⚠️ Pesan kosong atau tidak ada konten.")
+                await status_msg.edit("⚠️ Pesan kosong atau tidak ada konten.")
             return
 
+        # Coba forward (lebih cepat)
         if not is_no_forward(msg):
             try:
                 await client.forward_messages("me", msg)
+                await status_msg.delete()
                 return
             except Exception:
                 pass
 
+        await status_msg.edit("⏳ Sedang mendownload media...")
+
+        # Download manual
         try:
             if isinstance(msg.media, MessageMediaPhoto):
                 media_bytes = await client.download_media(msg.media, bytes)
@@ -231,37 +356,62 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                     file_obj = io.BytesIO(media_bytes)
                     file_obj.name = "photo.jpg"
                     caption = msg.text or ""
+                    await status_msg.delete()
                     await client.send_file("me", file=file_obj, caption=caption)
+                else:
+                    await status_msg.edit("❌ Gagal mendownload foto.")
 
             elif isinstance(msg.media, MessageMediaDocument):
                 doc  = msg.media.document
                 mime = getattr(doc, "mime_type", "") or ""
+
                 if is_sticker_doc(doc):
                     media_bytes = await client.download_media(msg.media, bytes)
                     if media_bytes:
                         file_obj = io.BytesIO(media_bytes)
-                        if "webp" in mime:
-                            file_obj.name = "sticker.webp"
-                        elif "tgsticker" in mime or "application/x-tgsticker" in mime:
-                            file_obj.name = "sticker.tgs"
-                        elif "video" in mime:
-                            file_obj.name = "sticker.webm"
-                        else:
-                            file_obj.name = "sticker.webp"
+                        if "webp" in mime:            file_obj.name = "sticker.webp"
+                        elif "tgsticker" in mime:     file_obj.name = "sticker.tgs"
+                        elif "video" in mime:         file_obj.name = "sticker.webm"
+                        else:                          file_obj.name = "sticker.webp"
+                        await status_msg.delete()
                         await client.send_file("me", file=file_obj, force_document=False)
+
+                elif "video" in mime or "mp4" in mime:
+                    video_attr = get_video_attributes(doc)
+                    fname = get_file_name(doc) or "video.mp4"
+                    media_bytes = await client.download_media(msg.media, bytes)
+                    if media_bytes:
+                        file_obj = io.BytesIO(media_bytes)
+                        file_obj.name = fname
+                        caption = msg.text or ""
+                        send_attrs = []
+                        if video_attr:
+                            send_attrs = [DocumentAttributeVideo(
+                                duration=video_attr.duration,
+                                w=video_attr.w,
+                                h=video_attr.h,
+                                supports_streaming=True,
+                                round_message=False,
+                            )]
+                        await status_msg.delete()
+                        await client.send_file(
+                            "me", file=file_obj,
+                            caption=caption, parse_mode="markdown",
+                            attributes=send_attrs if send_attrs else None,
+                            allow_cache=False,
+                        )
+                    else:
+                        await status_msg.edit("❌ Gagal mendownload video.")
+
                 else:
-                    fname = "document"
-                    for attr in doc.attributes:
-                        if hasattr(attr, "file_name") and attr.file_name:
-                            fname = attr.file_name
-                            break
+                    fname = get_file_name(doc) or "document"
                     if "." not in fname:
                         ext_map = {
-                            "video/mp4": ".mp4",
                             "audio/mpeg": ".mp3",
                             "audio/ogg": ".ogg",
                             "application/pdf": ".pdf",
                             "video/webm": ".webm",
+                            "image/gif": ".gif",
                         }
                         fname += ext_map.get(mime, "")
                     media_bytes = await client.download_media(msg.media, bytes)
@@ -269,15 +419,23 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                         file_obj = io.BytesIO(media_bytes)
                         file_obj.name = fname
                         caption = msg.text or ""
-                        await client.send_file("me", file=file_obj, caption=caption, force_document=False)
+                        await status_msg.delete()
+                        await client.send_file(
+                            "me", file=file_obj,
+                            caption=caption, force_document=False,
+                            allow_cache=False,
+                        )
+                    else:
+                        await status_msg.edit("❌ Gagal mendownload file.")
             else:
                 try:
                     await client.forward_messages("me", msg)
+                    await status_msg.delete()
                 except Exception:
-                    await client.send_message("me", "⚠️ Tipe media ini tidak didukung untuk di-copy.")
+                    await status_msg.edit("⚠️ Tipe media ini tidak didukung untuk di-copy.")
 
         except Exception as e:
-            await client.send_message("me", f"❌ Gagal mendownload media: `{e}`")
+            await status_msg.edit(f"❌ Gagal mendownload media: `{e}`")
 
     active_clients[user_id] = client
     print(f"✅ Client aktif untuk user {user_id}")
@@ -316,25 +474,16 @@ async def post_init(app):
 
 # ── ADMIN HELPERS ─────────────────────────────────────────────────
 def _resolve_target(target_str: str):
-    """Resolve user_id dari string. Prioritas: angka langsung, lalu cari by username."""
     clean = target_str.lstrip("@")
     if clean.isdigit():
         return int(clean)
-    # Coba cari by username di tabel users
     return get_user_by_username(clean)
 
 
 def _find_subscribed_user(target_str: str):
-    """
-    Resolve target untuk revoke.
-    Jika angka: langsung cek di tabel subscriptions (tidak perlu ada di tabel users).
-    Jika username: cari di tabel users dulu.
-    """
     clean = target_str.lstrip("@")
     if clean.isdigit():
-        # Langsung pakai angka, tidak perlu cek tabel users
         return int(clean)
-    # Cari by username
     return get_user_by_username(clean)
 
 
@@ -346,7 +495,6 @@ async def _do_gift(target_str: str, days: int, context) -> tuple:
             "Pastikan user sudah pernah membuka bot (/start) agar username-nya tercatat,\n"
             "atau gunakan *user\_id* (angka) langsung."
         )
-    # Pastikan user ada di tabel users sebelum insert subscriptions
     upsert_user(target_id, None, None)
     expired = activate_subscription(target_id, days=days)
     try:
@@ -369,7 +517,6 @@ async def _do_gift(target_str: str, days: int, context) -> tuple:
 
 
 async def _do_revoke(target_str: str, context) -> tuple:
-    # Gunakan _find_subscribed_user agar revoke by user_id tidak bergantung tabel users
     target_id = _find_subscribed_user(target_str)
     if target_id is None:
         return False, (
@@ -398,12 +545,9 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     uid = update.effective_user.id
     if uid != ADMIN_ID:
         return
-    # Hanya proses jika admin sedang dalam waiting state
-    # Jika tidak, biarkan handler lain (ConversationHandler, dll) yang handle
     if uid not in waiting_gift and uid not in waiting_revoke and uid not in waiting_restore:
         return
 
-    # Restore DB
     if uid in waiting_restore:
         waiting_restore.discard(uid)
         if not update.message.document:
@@ -428,7 +572,6 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(f"❌ Restore gagal: {e}", reply_markup=admin_keyboard())
         return
 
-    # Gift VIP
     if uid in waiting_gift:
         waiting_gift.discard(uid)
         text  = update.message.text.strip() if update.message.text else ""
@@ -442,7 +585,6 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard())
         return
 
-    # Revoke VIP
     if uid in waiting_revoke:
         waiting_revoke.discard(uid)
         text = update.message.text.strip() if update.message.text else ""
@@ -459,7 +601,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     user = update.effective_user
 
-    # Selalu bersihkan semua waiting state & temp saat /start
     waiting_gift.discard(uid)
     waiting_revoke.discard(uid)
     waiting_restore.discard(uid)
@@ -891,7 +1032,6 @@ def main():
         .build()
     )
 
-    # ── SETUP CONVERSATION HANDLER ─────────────────────────────
     setup_conv = ConversationHandler(
         entry_points=[CommandHandler("setup", cmd_setup)],
         states={
@@ -908,16 +1048,6 @@ def main():
         allow_reentry=True,
     )
 
-    # ── REGISTRASI HANDLER ─────────────────────────────────────
-    # group=0: admin_message_handler (hanya aktif saat waiting state)
-    # group=0 juga: semua CommandHandler & CallbackQueryHandler
-    # group=1: setup_conv (ConversationHandler)
-    #
-    # KENAPA setup_conv di group=1?
-    # ConversationHandler di group=0 bisa konflik dengan CommandHandler lain.
-    # Dengan group=1, ConversationHandler tetap berjalan paralel.
-    # CommandHandler di group=0 selalu diproses, termasuk /start di dalam fallbacks.
-
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & filters.User(ADMIN_ID),
@@ -927,7 +1057,6 @@ def main():
     )
 
     app.add_handler(setup_conv, group=1)
-
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
