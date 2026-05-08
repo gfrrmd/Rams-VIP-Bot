@@ -40,8 +40,6 @@ waiting_revoke  = set()
 temp_store     = {}
 active_clients = {}
 
-# Regex untuk parse link Telegram channel/post
-# Support: t.me/username/123, t.me/c/1234567890/123
 TG_LINK_RE = re.compile(
     r"(?:https?://)?t\.me/"
     r"(?:(?P<username>[a-zA-Z0-9_]+)/(?P<msg_id>\d+)|"
@@ -75,12 +73,10 @@ def is_view_once(message):
 
 
 def is_no_forward(message):
-    """Cek apakah pesan memiliki flag noforwards (protected content)."""
     return bool(getattr(message, "noforwards", False))
 
 
 def is_sticker_doc(doc):
-    """Deteksi stiker dari atribut dokumen (tanpa MessageMediaSticker)."""
     if doc is None:
         return False
     mime = getattr(doc, "mime_type", "") or ""
@@ -126,14 +122,10 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
     client = build_client(api_id, api_hash, string_session)
     await client.start()
 
-    # ── .dl HANDLER ─────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.dl$"))
     async def dl_handler(event):
         if not is_subscribed(user_id):
-            await event.client.send_message(
-                "me",
-                "❌ Akses `.dl` membutuhkan langganan VIP aktif."
-            )
+            await event.client.send_message("me", "❌ Akses `.dl` membutuhkan langganan VIP aktif.")
             return
         await event.delete()
         if not event.is_reply:
@@ -153,7 +145,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
         chat_title = escape_md(getattr(chat, "title", None) or "Private Chat")
         caption    = f"📥 **Dari:** {mention}\n💬 **Chat:** {chat_title}"
 
-        # Coba forward dulu, kalau gagal download
         if not is_no_forward(replied):
             try:
                 await client.forward_messages("me", replied)
@@ -162,7 +153,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             except Exception:
                 pass
 
-        # Fallback: download manual
         try:
             media_bytes = await client.download_media(replied.media, bytes)
         except Exception:
@@ -184,14 +174,10 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             file_obj.name = fname
         await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
 
-    # ── .copy HANDLER ─────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.copy\s+(https?://t\.me/\S+)$"))
     async def copy_handler(event):
         if not is_subscribed(user_id):
-            await event.client.send_message(
-                "me",
-                "❌ Akses `.copy` membutuhkan langganan VIP aktif."
-            )
+            await event.client.send_message("me", "❌ Akses `.copy` membutuhkan langganan VIP aktif.")
             return
         await event.delete()
 
@@ -201,7 +187,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             await client.send_message("me", "❌ Link tidak valid. Gunakan format: `.copy https://t.me/channel/123`")
             return
 
-        # Tentukan channel dan message ID
         username_part   = m.group("username")
         msg_id_part     = m.group("msg_id")
         channel_id_part = m.group("channel_id")
@@ -231,8 +216,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
 
         await status_msg.delete()
 
-        # ── Proses berdasarkan tipe konten ──────────────────────────
-        # 1. Teks saja (tanpa media)
         if not msg.media:
             text_content = msg.text or msg.message or ""
             if text_content:
@@ -241,18 +224,15 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                 await client.send_message("me", "⚠️ Pesan kosong atau tidak ada konten.")
             return
 
-        # 2. Coba forward langsung dulu (lebih cepat, hemat bandwidth)
         if not is_no_forward(msg):
             try:
                 await client.forward_messages("me", msg)
                 return
             except Exception:
-                pass  # Kalau gagal, lanjut ke metode download
+                pass
 
-        # 3. Download manual (untuk restricted/noforwards)
         try:
             if isinstance(msg.media, MessageMediaPhoto):
-                # Foto
                 media_bytes = await client.download_media(msg.media, bytes)
                 if media_bytes:
                     file_obj = io.BytesIO(media_bytes)
@@ -263,9 +243,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             elif isinstance(msg.media, MessageMediaDocument):
                 doc  = msg.media.document
                 mime = getattr(doc, "mime_type", "") or ""
-
                 if is_sticker_doc(doc):
-                    # Stiker: download dan kirim sebagai stiker
                     media_bytes = await client.download_media(msg.media, bytes)
                     if media_bytes:
                         file_obj = io.BytesIO(media_bytes)
@@ -279,7 +257,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                             file_obj.name = "sticker.webp"
                         await client.send_file("me", file=file_obj, force_document=False)
                 else:
-                    # Dokumen / video / audio biasa
                     fname = "document"
                     for attr in doc.attributes:
                         if hasattr(attr, "file_name") and attr.file_name:
@@ -299,13 +276,8 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                         file_obj = io.BytesIO(media_bytes)
                         file_obj.name = fname
                         caption = msg.text or ""
-                        await client.send_file(
-                            "me", file=file_obj,
-                            caption=caption,
-                            force_document=False
-                        )
+                        await client.send_file("me", file=file_obj, caption=caption, force_document=False)
             else:
-                # Media lain (voice, gif, dll) — coba forward, kalau gagal skip
                 try:
                     await client.forward_messages("me", msg)
                 except Exception:
@@ -349,10 +321,128 @@ async def post_init(app):
     print("✅ Semua session berhasil dimuat!")
 
 
+# ── ADMIN HELPERS ─────────────────────────────────────────
+def _resolve_target(target_str: str):
+    if target_str.lstrip("@").isdigit() and not target_str.startswith("@"):
+        return int(target_str)
+    return get_user_by_username(target_str)
+
+
+async def _do_gift(target_str: str, days: int, context) -> tuple:
+    target_id = _resolve_target(target_str)
+    if target_id is None:
+        return False, f"❌ User `{target_str}` tidak ditemukan di database."
+    # Pastikan user ada di tabel users (hindari foreign key error)
+    upsert_user(target_id, None, None)
+    expired = activate_subscription(target_id, days=days)
+    # Notifikasi ke user yang di-gift
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🎁 *Selamat\! VIP kamu telah diaktifkan\!*\n\n"
+                f"📅 Aktif hingga: *{expired.strftime('%d %b %Y')}*\n"
+                f"⏳ Durasi: *{days} hari*\n\n"
+                f"Gunakan /start untuk melihat status langganan kamu\."
+            ),
+            parse_mode="MarkdownV2"
+        )
+    except Exception:
+        pass
+    return True, (
+        f"🎁 VIP berhasil diberikan ke `{target_id}` selama *{days} hari*\n"
+        f"Aktif hingga: *{expired.strftime('%d %b %Y')}*"
+    )
+
+
+async def _do_revoke(target_str: str, context) -> tuple:
+    target_id = _resolve_target(target_str)
+    if target_id is None:
+        return False, f"❌ User `{target_str}` tidak ditemukan di database."
+    if not is_subscribed(target_id):
+        return False, f"⚠️ User `{target_id}` tidak memiliki langganan VIP aktif."
+    revoke_subscription(target_id)
+    # Notifikasi ke user yang di-revoke
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="🚫 *VIP kamu telah dicabut oleh admin\.* Hubungi admin jika ada pertanyaan\.",
+            parse_mode="MarkdownV2"
+        )
+    except Exception:
+        pass
+    return True, f"✅ VIP user `{target_id}` berhasil dicabut."
+
+
+# ── ADMIN INCOMING MESSAGE HANDLER ─────────────────────────
+# Didaftarkan di group=0 agar lebih prioritas dari ConversationHandler
+async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        return
+
+    # Restore DB
+    if uid in waiting_restore:
+        waiting_restore.discard(uid)
+        if not update.message.document:
+            await update.message.reply_text("❌ Kirim file .sql yang valid.")
+            return
+        file = await context.bot.get_file(update.message.document.file_id)
+        buf  = io.BytesIO()
+        await file.download_to_memory(buf)
+        sql  = buf.getvalue().decode()
+        try:
+            from database import get_conn
+            conn = get_conn()
+            cur  = conn.cursor()
+            for stmt in sql.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    cur.execute(stmt)
+            conn.commit()
+            conn.close()
+            await update.message.reply_text("✅ Restore berhasil!", reply_markup=admin_keyboard())
+        except Exception as e:
+            await update.message.reply_text(f"❌ Restore gagal: {e}", reply_markup=admin_keyboard())
+        return
+
+    # Gift VIP
+    if uid in waiting_gift:
+        waiting_gift.discard(uid)
+        text  = update.message.text.strip() if update.message.text else ""
+        parts = text.split()
+        if not parts:
+            await update.message.reply_text("❌ Input tidak valid.", reply_markup=admin_keyboard())
+            return
+        target_str = parts[0]
+        days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
+        ok, msg = await _do_gift(target_str, days, context)
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard())
+        return
+
+    # Revoke VIP
+    if uid in waiting_revoke:
+        waiting_revoke.discard(uid)
+        text = update.message.text.strip() if update.message.text else ""
+        if not text:
+            await update.message.reply_text("❌ Input tidak valid.", reply_markup=admin_keyboard())
+            return
+        ok, msg = await _do_revoke(text, context)
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard())
+        return
+
+
 # ── COMMAND HANDLERS ──────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     user = update.effective_user
+
+    # Jika admin sedang dalam waiting state, batalkan dulu
+    if uid == ADMIN_ID:
+        waiting_gift.discard(uid)
+        waiting_revoke.discard(uid)
+        waiting_restore.discard(uid)
+
     upsert_user(uid, user.username, user.full_name)
     session = get_user_session(uid)
     client  = active_clients.get(uid)
@@ -390,7 +480,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: /revoke <user_id atau @username>"""
     uid = update.effective_user.id
     if uid != ADMIN_ID:
         await update.message.reply_text("❌ Kamu tidak memiliki izin.")
@@ -402,30 +491,11 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    target_str = args[0].strip()
-    target_id  = _resolve_target(target_str)
-    if target_id is None:
-        await update.message.reply_text(
-            f"❌ User `{target_str}` tidak ditemukan di database.",
-            parse_mode="Markdown"
-        )
-        return
-    if not is_subscribed(target_id):
-        await update.message.reply_text(
-            f"⚠️ User `{target_id}` tidak memiliki langganan VIP aktif.",
-            parse_mode="Markdown"
-        )
-        return
-    revoke_subscription(target_id)
-    await update.message.reply_text(
-        f"✅ VIP user `{target_id}` berhasil dicabut.",
-        parse_mode="Markdown",
-        reply_markup=admin_keyboard()
-    )
+    ok, msg = await _do_revoke(args[0].strip(), context)
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard() if ok else None)
 
 
 async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: /gift <user_id atau @username> [days]"""
     uid = update.effective_user.id
     if uid != ADMIN_ID:
         await update.message.reply_text("❌ Kamu tidak memiliki izin.")
@@ -440,27 +510,8 @@ async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target_str = args[0].strip()
     days = int(args[1]) if len(args) > 1 and args[1].isdigit() else 30
-    target_id = _resolve_target(target_str)
-    if target_id is None:
-        await update.message.reply_text(
-            f"❌ User `{target_str}` tidak ditemukan di database.",
-            parse_mode="Markdown"
-        )
-        return
-    expired = activate_subscription(target_id, days=days)
-    await update.message.reply_text(
-        f"🎁 VIP berhasil diberikan ke `{target_id}` selama *{days} hari*\n"
-        f"Aktif hingga: *{expired.strftime('%d %b %Y')}*",
-        parse_mode="Markdown",
-        reply_markup=admin_keyboard()
-    )
-
-
-def _resolve_target(target_str: str):
-    """Resolve user_id dari ID angka atau @username."""
-    if target_str.lstrip("@").isdigit() and not target_str.startswith("@"):
-        return int(target_str)
-    return get_user_by_username(target_str)
+    ok, msg = await _do_gift(target_str, days, context)
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard() if ok else None)
 
 
 # ── SETUP CONVERSATION ────────────────────────────────
@@ -468,8 +519,7 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_subscribed(uid):
         await update.message.reply_text(
-            "❌ Kamu belum berlangganan VIP.\n\n"
-            "Untuk berlangganan VIP, silakan hubungi admin.",
+            "❌ Kamu belum berlangganan VIP.\n\nUntuk berlangganan VIP, silakan hubungi admin.",
             parse_mode="Markdown", reply_markup=main_keyboard(uid)
         )
         return ConversationHandler.END
@@ -538,7 +588,10 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await client.disconnect()
         temp_store.pop(uid, None)
-        await update.message.reply_text(f"❌ Gagal kirim OTP: `{e}`\nSilakan /setup ulang.", parse_mode="Markdown", reply_markup=main_keyboard(uid))
+        await update.message.reply_text(
+            f"❌ Gagal kirim OTP: `{e}`\nSilakan /setup ulang.",
+            parse_mode="Markdown", reply_markup=main_keyboard(uid)
+        )
         return ConversationHandler.END
 
 
@@ -579,7 +632,9 @@ async def setup_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await client.disconnect()
         temp_store.pop(uid, None)
-        await update.message.reply_text(f"❌ Password 2FA salah: `{e}`\nSilakan /setup ulang.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Password 2FA salah: `{e}`\nSilakan /setup ulang.", parse_mode="Markdown"
+        )
         return ConversationHandler.END
     return await _finish_setup(update, uid, data, client)
 
@@ -642,6 +697,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
     elif data == "menu_back":
+        # Bersihkan waiting state saat kembali ke menu utama
+        waiting_gift.discard(uid)
+        waiting_revoke.discard(uid)
+        waiting_restore.discard(uid)
         await query.edit_message_text(
             "👋 *Menu Utama*\n\nPilih menu di bawah:",
             parse_mode="Markdown", reply_markup=main_keyboard(uid)
@@ -734,88 +793,6 @@ async def _do_backup(query, context):
         await query.edit_message_text(f"❌ Backup gagal: {e}", reply_markup=admin_keyboard())
 
 
-# ── MESSAGE HANDLER ───────────────────────────────────
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-
-    # Admin: Restore DB
-    if uid == ADMIN_ID and uid in waiting_restore:
-        waiting_restore.discard(uid)
-        if not update.message.document:
-            await update.message.reply_text("❌ Kirim file .sql yang valid.")
-            return
-        file = await context.bot.get_file(update.message.document.file_id)
-        buf  = io.BytesIO()
-        await file.download_to_memory(buf)
-        sql  = buf.getvalue().decode()
-        try:
-            from database import get_conn
-            conn = get_conn()
-            cur  = conn.cursor()
-            for stmt in sql.split(";"):
-                stmt = stmt.strip()
-                if stmt:
-                    cur.execute(stmt)
-            conn.commit()
-            conn.close()
-            await update.message.reply_text("✅ Restore berhasil!", reply_markup=admin_keyboard())
-        except Exception as e:
-            await update.message.reply_text(f"❌ Restore gagal: {e}", reply_markup=admin_keyboard())
-        return
-
-    # Admin: Gift VIP via menu
-    if uid == ADMIN_ID and uid in waiting_gift:
-        waiting_gift.discard(uid)
-        text = update.message.text.strip() if update.message.text else ""
-        parts = text.split()
-        if not parts:
-            await update.message.reply_text("❌ Input tidak valid.", reply_markup=admin_keyboard())
-            return
-        target_str = parts[0]
-        days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
-        target_id = _resolve_target(target_str)
-        if target_id is None:
-            await update.message.reply_text(
-                f"❌ User `{target_str}` tidak ditemukan.",
-                parse_mode="Markdown", reply_markup=admin_keyboard()
-            )
-            return
-        expired = activate_subscription(target_id, days=days)
-        await update.message.reply_text(
-            f"🎁 VIP diberikan ke `{target_id}` selama *{days} hari*\n"
-            f"Aktif hingga: *{expired.strftime('%d %b %Y')}*",
-            parse_mode="Markdown", reply_markup=admin_keyboard()
-        )
-        return
-
-    # Admin: Revoke VIP via menu
-    if uid == ADMIN_ID and uid in waiting_revoke:
-        waiting_revoke.discard(uid)
-        text = update.message.text.strip() if update.message.text else ""
-        if not text:
-            await update.message.reply_text("❌ Input tidak valid.", reply_markup=admin_keyboard())
-            return
-        target_id = _resolve_target(text)
-        if target_id is None:
-            await update.message.reply_text(
-                f"❌ User `{text}` tidak ditemukan di database.",
-                parse_mode="Markdown", reply_markup=admin_keyboard()
-            )
-            return
-        if not is_subscribed(target_id):
-            await update.message.reply_text(
-                f"⚠️ User `{target_id}` tidak punya VIP aktif.",
-                parse_mode="Markdown", reply_markup=admin_keyboard()
-            )
-            return
-        revoke_subscription(target_id)
-        await update.message.reply_text(
-            f"✅ VIP user `{target_id}` berhasil dicabut.",
-            parse_mode="Markdown", reply_markup=admin_keyboard()
-        )
-        return
-
-
 # ── MAIN ──────────────────────────────────────────────
 def main():
     app = (
@@ -841,13 +818,23 @@ def main():
         allow_reentry=True,
     )
 
-    app.add_handler(setup_conv)
-    app.add_handler(CommandHandler("start", cmd_start))
+    # ⚠️ PENTING: admin_message_handler di group=0 (prioritas tertinggi)
+    # agar tidak diblokir oleh ConversationHandler
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.Document.ALL) & filters.User(ADMIN_ID),
+            admin_message_handler
+        ),
+        group=0
+    )
+
+    # Setup conversation & command handlers di group=1 (default)
+    app.add_handler(setup_conv, group=1)
+    app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
-    app.add_handler(CommandHandler("gift", cmd_gift))
+    app.add_handler(CommandHandler("gift",   cmd_gift))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
 
     print("🤖 Rams VIP Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
