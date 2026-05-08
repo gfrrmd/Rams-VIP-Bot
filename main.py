@@ -21,7 +21,7 @@ from database import (
     get_user_by_username
 )
 
-# ── ENV VARS ──────────────────────────────────────────
+# ── ENV VARS ──────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
 ADMIN_ID    = int(os.environ["ADMIN_ID"])
 
@@ -47,7 +47,7 @@ TG_LINK_RE = re.compile(
 )
 
 
-# ── HELPERS ──────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────
 def build_client(api_id, api_hash, session_string=""):
     return TelegramClient(
         StringSession(session_string), api_id, api_hash,
@@ -63,13 +63,6 @@ def escape_md(text):
     for ch in ["[", "]", "(", ")", "*", "_", "`"]:
         text = text.replace(ch, f"\\{ch}")
     return text
-
-
-def is_view_once(message):
-    media = message.media
-    if isinstance(media, (MessageMediaPhoto, MessageMediaDocument)):
-        return bool(getattr(media, "ttl_seconds", None))
-    return False
 
 
 def is_no_forward(message):
@@ -291,7 +284,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
     asyncio.ensure_future(client.run_until_disconnected())
 
 
-# ── POST INIT ─────────────────────────────────────────
+# ── POST INIT ─────────────────────────────────────────────────────
 async def post_init(app):
     try:
         init_db()
@@ -321,7 +314,7 @@ async def post_init(app):
     print("✅ Semua session berhasil dimuat!")
 
 
-# ── ADMIN HELPERS ─────────────────────────────────────────
+# ── ADMIN HELPERS ─────────────────────────────────────────────────
 def _resolve_target(target_str: str):
     if target_str.lstrip("@").isdigit() and not target_str.startswith("@"):
         return int(target_str)
@@ -332,20 +325,18 @@ async def _do_gift(target_str: str, days: int, context) -> tuple:
     target_id = _resolve_target(target_str)
     if target_id is None:
         return False, f"❌ User `{target_str}` tidak ditemukan di database."
-    # Pastikan user ada di tabel users (hindari foreign key error)
     upsert_user(target_id, None, None)
     expired = activate_subscription(target_id, days=days)
-    # Notifikasi ke user yang di-gift
     try:
         await context.bot.send_message(
             chat_id=target_id,
             text=(
-                f"🎁 *Selamat\! VIP kamu telah diaktifkan\!*\n\n"
+                f"🎁 *Selamat! VIP kamu telah diaktifkan!*\n\n"
                 f"📅 Aktif hingga: *{expired.strftime('%d %b %Y')}*\n"
                 f"⏳ Durasi: *{days} hari*\n\n"
-                f"Gunakan /start untuk melihat status langganan kamu\."
+                f"Gunakan /start untuk melihat status langganan kamu."
             ),
-            parse_mode="MarkdownV2"
+            parse_mode="Markdown"
         )
     except Exception:
         pass
@@ -362,23 +353,25 @@ async def _do_revoke(target_str: str, context) -> tuple:
     if not is_subscribed(target_id):
         return False, f"⚠️ User `{target_id}` tidak memiliki langganan VIP aktif."
     revoke_subscription(target_id)
-    # Notifikasi ke user yang di-revoke
     try:
         await context.bot.send_message(
             chat_id=target_id,
-            text="🚫 *VIP kamu telah dicabut oleh admin\.* Hubungi admin jika ada pertanyaan\.",
-            parse_mode="MarkdownV2"
+            text="🚫 *VIP kamu telah dicabut oleh admin.* Hubungi admin jika ada pertanyaan.",
+            parse_mode="Markdown"
         )
     except Exception:
         pass
     return True, f"✅ VIP user `{target_id}` berhasil dicabut."
 
 
-# ── ADMIN INCOMING MESSAGE HANDLER ─────────────────────────
-# Didaftarkan di group=0 agar lebih prioritas dari ConversationHandler
+# ── ADMIN MESSAGE HANDLER (group=0, prioritas tertinggi) ──────────
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Hanya proses jika admin sedang dalam waiting state
+    # Jika tidak dalam waiting state, biarkan handler lain yang tangani
     uid = update.effective_user.id
     if uid != ADMIN_ID:
+        return
+    if uid not in waiting_gift and uid not in waiting_revoke and uid not in waiting_restore:
         return
 
     # Restore DB
@@ -432,16 +425,16 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
 
-# ── COMMAND HANDLERS ──────────────────────────────────
+# ── COMMAND HANDLERS ──────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     user = update.effective_user
 
-    # Jika admin sedang dalam waiting state, batalkan dulu
-    if uid == ADMIN_ID:
-        waiting_gift.discard(uid)
-        waiting_revoke.discard(uid)
-        waiting_restore.discard(uid)
+    # Selalu bersihkan semua waiting state saat /start
+    waiting_gift.discard(uid)
+    waiting_revoke.discard(uid)
+    waiting_restore.discard(uid)
+    temp_store.pop(uid, None)
 
     upsert_user(uid, user.username, user.full_name)
     session = get_user_session(uid)
@@ -514,7 +507,7 @@ async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard() if ok else None)
 
 
-# ── SETUP CONVERSATION ────────────────────────────────
+# ── SETUP CONVERSATION ────────────────────────────────────────────
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_subscribed(uid):
@@ -526,12 +519,20 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_store.pop(uid, None)
     await update.message.reply_text(
         "🔧 *Setup Session Telegram*\n\n"
+        "Proses ini menghubungkan akun Telegram kamu ke bot.\n"
         "Ketik /cancel kapan saja untuk membatalkan.\n\n"
         "━━━━━━━━━━━━━━━━━\n"
         "*Langkah 1 dari 5 — API ID*\n\n"
-        "📌 Kunjungi https://my.telegram.org → *API development tools*\n"
-        "Salin angka di kolom *App api_id* dan kirim di sini:",
-        parse_mode="Markdown"
+        "API ID adalah kode angka unik untuk aplikasi Telegram buatanmu.\n\n"
+        "📌 *Cara mendapatkan API ID:*\n"
+        "1\\. Buka https://my\\.telegram\\.org di browser\n"
+        "2\\. Login dengan nomor HP Telegram kamu\n"
+        "3\\. Masukkan kode OTP yang dikirim ke Telegram\n"
+        "4\\. Klik *API development tools*\n"
+        "5\\. Isi form \\(nama & platform bebas\\), lalu klik *Create application*\n"
+        "6\\. Salin angka di kolom *App api\\_id*\n\n"
+        "Kirim angka tersebut di sini:",
+        parse_mode="MarkdownV2"
     )
     return API_ID_STEP
 
@@ -540,27 +541,52 @@ async def setup_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
     if not text.isdigit():
-        await update.message.reply_text("❌ API ID harus berupa angka. Coba lagi:")
+        await update.message.reply_text(
+            "❌ API ID harus berupa *angka saja*, bukan huruf.\n\n"
+            "Contoh yang benar: `12345678`\n\n"
+            "Coba kirim ulang:",
+            parse_mode="Markdown"
+        )
         return API_ID_STEP
     temp_store.setdefault(uid, {})["api_id"] = int(text)
     await update.message.reply_text(
         "✅ API ID tersimpan!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
         "*Langkah 2 dari 5 — API Hash*\n\n"
-        "Salin teks panjang di kolom *App api_hash* (32 karakter) dan kirim:",
+        "API Hash adalah kode acak 32 karakter (campuran huruf & angka).\n\n"
+        "📌 *Cara mendapatkan API Hash:*\n"
+        "Di halaman yang sama (my.telegram.org → API development tools),\n"
+        "salin teks panjang di kolom *App api\\_hash*\n\n"
+        "Contoh: `a1b2c3d4e5f6...` _(32 karakter)_\n\n"
+        "Kirim API Hash kamu di sini:",
         parse_mode="Markdown"
     )
     return API_HASH_STEP
 
 
 async def setup_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    temp_store.setdefault(uid, {})["api_hash"] = update.message.text.strip()
+    uid  = update.effective_user.id
+    text = update.message.text.strip()
+    if len(text) < 10:
+        await update.message.reply_text(
+            "❌ API Hash sepertinya terlalu pendek.\n\n"
+            "API Hash seharusnya 32 karakter, campuran huruf dan angka.\n"
+            "Pastikan kamu menyalin seluruhnya dari my.telegram.org\n\n"
+            "Coba kirim ulang:",
+            parse_mode="Markdown"
+        )
+        return API_HASH_STEP
+    temp_store.setdefault(uid, {})["api_hash"] = text
     await update.message.reply_text(
         "✅ API Hash tersimpan!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
         "*Langkah 3 dari 5 — Nomor HP*\n\n"
-        "Format: `+628xxxxxxxxxx`\n\nKirim nomor HP kamu:",
+        "Masukkan nomor HP yang terdaftar di akun Telegram kamu.\n\n"
+        "📌 *Format yang benar:*\n"
+        "• Awali dengan kode negara\n"
+        "• Indonesia: `+628xxxxxxxxxx`\n"
+        "• Contoh: `+6281234567890`\n\n"
+        "Kirim nomor HP kamu:",
         parse_mode="Markdown"
     )
     return PHONE_STEP
@@ -578,10 +604,15 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_store[uid]["phone_hash"] = result.phone_code_hash
         temp_store[uid]["client"]     = client
         await update.message.reply_text(
-            "📨 Kode OTP dikirim ke Telegram kamu!\n\n"
+            "📨 Kode OTP berhasil dikirim ke Telegram kamu!\n\n"
             "━━━━━━━━━━━━━━━━━\n"
             "*Langkah 4 dari 5 — Kode OTP*\n\n"
-            "Ketik kode *dengan spasi* (contoh: `1 2 3 4 5`):",
+            "Buka aplikasi Telegram kamu, cari pesan dari *Telegram* "
+            "yang berisi 5 digit kode verifikasi.\n\n"
+            "📌 *Cara mengirim kode:*\n"
+            "Ketik kode dengan *spasi di antara setiap angka*\n\n"
+            "Contoh: jika kode kamu `12345`, kirim: `1 2 3 4 5`\n\n"
+            "_(Spasi wajib, agar Telegram tidak mendeteksi sebagai aktivitas mencurigakan)_",
             parse_mode="Markdown"
         )
         return CODE_STEP
@@ -589,7 +620,11 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
         temp_store.pop(uid, None)
         await update.message.reply_text(
-            f"❌ Gagal kirim OTP: `{e}`\nSilakan /setup ulang.",
+            f"❌ Gagal mengirim OTP: `{e}`\n\n"
+            "Kemungkinan penyebab:\n"
+            "• Nomor HP salah format (harus pakai +62...)\n"
+            "• API ID atau API Hash salah\n\n"
+            "Silakan /setup ulang dari awal.",
             parse_mode="Markdown", reply_markup=main_keyboard(uid)
         )
         return ConversationHandler.END
@@ -604,15 +639,24 @@ async def setup_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.sign_in(data["phone"], code, phone_code_hash=data["phone_hash"])
     except SessionPasswordNeededError:
         await update.message.reply_text(
-            "🔐 Akun ini menggunakan 2FA.\n\n"
-            "*Langkah 5 dari 5 — Password 2FA*\n\nKirim password 2FA kamu:",
+            "🔐 *Akun ini mengaktifkan verifikasi 2 langkah (2FA)*\n\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "*Langkah 5 dari 5 — Password 2FA*\n\n"
+            "Masukkan password 2FA Telegram kamu.\n\n"
+            "📌 Ini adalah password yang kamu buat sendiri di:\n"
+            "Telegram → Pengaturan → Privasi & Keamanan → Verifikasi 2 Langkah\n\n"
+            "Kirim password kamu:",
             parse_mode="Markdown"
         )
         return PASSWORD_STEP
     except (PhoneCodeInvalidError, PhoneCodeExpiredError):
         await client.disconnect()
         temp_store.pop(uid, None)
-        await update.message.reply_text("❌ Kode OTP salah/kadaluarsa. Silakan /setup ulang.")
+        await update.message.reply_text(
+            "❌ Kode OTP salah atau sudah kadaluarsa.\n\n"
+            "Silakan /setup ulang untuk mendapatkan kode baru.",
+            parse_mode="Markdown"
+        )
         return ConversationHandler.END
     except Exception as e:
         await client.disconnect()
@@ -633,7 +677,8 @@ async def setup_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
         temp_store.pop(uid, None)
         await update.message.reply_text(
-            f"❌ Password 2FA salah: `{e}`\nSilakan /setup ulang.", parse_mode="Markdown"
+            f"❌ Password 2FA salah: `{e}`\n\nSilakan /setup ulang.",
+            parse_mode="Markdown"
         )
         return ConversationHandler.END
     return await _finish_setup(update, uid, data, client)
@@ -645,12 +690,16 @@ async def _finish_setup(update, uid, data, client):
     await start_client_for_user(uid, data["api_id"], data["api_hash"], string_session)
     temp_store.pop(uid, None)
     await update.message.reply_text(
-        "✅ *Setup berhasil!*\n\n"
-        "Session kamu sudah aktif.\n\n"
-        "📌 *Cara pakai fitur:*\n"
-        "• Reply pesan lalu ketik `.dl` → download/forward ke Saved Messages\n"
-        "• Ketik `.copy <link>` → copy konten dari channel restricted ke Saved Messages\n\n"
-        "Contoh: `.copy https://t.me/channelname/123`",
+        "✅ *Setup berhasil! Session kamu sudah aktif.*\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "📌 *Cara pakai fitur VIP:*\n\n"
+        "🔹 *Download media view-once / restricted:*\n"
+        "Reply pesan yang ingin di-download, lalu ketik `.dl`\n"
+        "_(Media akan dikirim ke Saved Messages kamu)_\n\n"
+        "🔹 *Copy konten dari channel restricted:*\n"
+        "Ketik `.copy` + link pesan\n"
+        "Contoh: `.copy https://t.me/channelname/123`\n"
+        "_(Konten akan dikirim ke Saved Messages kamu)_",
         parse_mode="Markdown",
         reply_markup=main_keyboard(uid)
     )
@@ -697,7 +746,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
     elif data == "menu_back":
-        # Bersihkan waiting state saat kembali ke menu utama
+        # Bersihkan waiting state
         waiting_gift.discard(uid)
         waiting_revoke.discard(uid)
         waiting_restore.discard(uid)
@@ -737,7 +786,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ── HELPER: SUBSCRIPTION ──────────────────────────────
+# ── HELPER: SUBSCRIPTION ──────────────────────────────────────────
 async def _do_subscription(query, uid):
     if is_subscribed(uid):
         info    = get_subscription_info(uid)
@@ -755,7 +804,7 @@ async def _do_subscription(query, uid):
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_keyboard(uid))
 
 
-# ── HELPER: BACKUP ────────────────────────────────────
+# ── HELPER: BACKUP ────────────────────────────────────────────────
 async def _do_backup(query, context):
     try:
         from database import get_conn
@@ -793,7 +842,7 @@ async def _do_backup(query, context):
         await query.edit_message_text(f"❌ Backup gagal: {e}", reply_markup=admin_keyboard())
 
 
-# ── MAIN ──────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────
 def main():
     app = (
         Application.builder()
@@ -813,28 +862,29 @@ def main():
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            CommandHandler("start", cmd_start),
+            CommandHandler("start",  cmd_start),
         ],
         allow_reentry=True,
     )
 
-    # ⚠️ PENTING: admin_message_handler di group=0 (prioritas tertinggi)
-    # agar tidak diblokir oleh ConversationHandler
+    # ⚠️ PENTING: admin_message_handler di group=0
+    # Hanya aktif jika admin dalam waiting state (gift/revoke/restore)
+    # Jika tidak dalam waiting state, handler ini langsung return
+    # sehingga pesan diteruskan ke handler lain (group=1)
     app.add_handler(
         MessageHandler(
-            (filters.TEXT | filters.Document.ALL) & filters.User(ADMIN_ID),
+            (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & filters.User(ADMIN_ID),
             admin_message_handler
         ),
         group=0
     )
 
-    # Setup conversation & command handlers di group=1 (default)
-    app.add_handler(setup_conv, group=1)
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("gift",   cmd_gift))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(setup_conv, group=1)
 
     print("🤖 Rams VIP Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
