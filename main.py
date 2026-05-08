@@ -44,6 +44,13 @@ waiting_revoke  = set()
 temp_store     = {}
 active_clients = {}
 
+# ── DEDUP & LOCK: mencegah .dl diproses dua kali ──────────────────────
+# Key: user_id → asyncio.Lock (satu proses .dl dalam satu waktu per user)
+dl_locks: dict[int, asyncio.Lock] = {}
+# Key: user_id → set of event.id yang sudah diproses (TTL manual: max 50 item)
+dl_seen:  dict[int, set]          = {}
+
+
 TG_LINK_RE = re.compile(
     r"(?:https?://)?t\.me/"
     r"(?:c/(?P<channel_id>\d+)/(?P<msg_id2>\d+)|"
@@ -85,10 +92,6 @@ def is_sticker_doc(doc):
 
 
 def get_video_attributes(doc):
-    """
-    Ambil DocumentAttributeVideo dari dokumen asli.
-    Digunakan untuk mempertahankan dimensi video saat re-upload.
-    """
     if doc is None:
         return None
     for attr in getattr(doc, "attributes", []):
@@ -98,13 +101,29 @@ def get_video_attributes(doc):
 
 
 def get_file_name(doc):
-    """Ambil nama file dari atribut dokumen."""
     if doc is None:
         return None
     for attr in getattr(doc, "attributes", []):
         if isinstance(attr, DocumentAttributeFilename):
             return attr.file_name
     return None
+
+
+def _dl_dedup_check(user_id: int, event_id: int) -> bool:
+    """
+    Return True jika event ini SUDAH diproses (duplikat), False jika belum.
+    Otomatis batasi ukuran set ke 50 entry.
+    """
+    seen = dl_seen.setdefault(user_id, set())
+    if event_id in seen:
+        return True  # duplikat!
+    seen.add(event_id)
+    if len(seen) > 50:
+        # Buang separuh entry terlama
+        to_remove = list(seen)[:25]
+        for x in to_remove:
+            seen.discard(x)
+    return False
 
 
 def main_keyboard(uid):
@@ -114,6 +133,7 @@ def main_keyboard(uid):
             InlineKeyboardButton("💎 Beli VIP", callback_data="menu_beli"),
             InlineKeyboardButton("⌛️ Status Langganan", callback_data="menu_subscription"),
         ],
+        [InlineKeyboardButton("📖 Cara Penggunaan", callback_data="menu_guide")],
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton("👤 Menu Admin", callback_data="menu_admin")])
@@ -134,10 +154,47 @@ def admin_keyboard():
     ])
 
 
+GUIDE_TEXT = (
+    "📖 *Panduan Penggunaan Rams VIP Bot*\n\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "🔹 *Command `.dl` \u2014 Download Media*\n"
+    "Digunakan untuk mendownload media *view-once* (sekali lihat) atau "
+    "media dari chat *restricted* yang tidak bisa di-forward.\n\n"
+    "*Cara pakai:*\n"
+    "1. Buka chat yang ada media view-once atau restricted\n"
+    "2. *Reply* (balas) pesan media tersebut\n"
+    "3. Ketik `.dl` lalu kirim\n"
+    "4. Media akan otomatis tersimpan di *Saved Messages* kamu\n\n"
+    "⚠️ *Catatan:* Pastikan kamu sudah reply ke pesan medianya, bukan ke pesan teks biasa.\n\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "🔹 *Command `.copy` \u2014 Copy dari Channel/Grup*\n"
+    "Digunakan untuk menyalin konten (foto, video, dokumen, teks) dari "
+    "channel atau grup yang *tidak mengizinkan forward*.\n\n"
+    "*Cara pakai:*\n"
+    "1. Buka pesan yang ingin di-copy di channel/grup\n"
+    "2. Salin link pesan tersebut (klik kanan pesan \u2192 *Copy Link*)\n"
+    "3. Ketik `.copy <link>` di chat mana saja\n"
+    "4. Konten akan dikirim ke *Saved Messages* kamu\n\n"
+    "*Format link yang didukung:*\n"
+    "\u2022 Public: `.copy https://t.me/namaChannel/123`\n"
+    "\u2022 Private: `.copy https://t.me/c/1234567890/123`\n\n"
+    "⚠️ *Catatan:* Untuk channel private, akun kamu harus sudah *bergabung* ke channel tersebut.\n\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "💡 *Tips:*\n"
+    "\u2022 Semua hasil download dikirim ke *Saved Messages* (pesan tersimpan) akun Telegram kamu\n"
+    "\u2022 Pastikan session sudah di-setup via /setup sebelum menggunakan fitur ini\n"
+    "\u2022 Fitur ini hanya tersedia untuk pengguna VIP aktif"
+)
+
+
 async def start_client_for_user(user_id, api_id, api_hash, string_session):
     old = active_clients.get(user_id)
     if old and old.is_connected():
         await old.disconnect()
+
+    # Inisialisasi lock & dedup untuk user ini
+    if user_id not in dl_locks:
+        dl_locks[user_id] = asyncio.Lock()
 
     client = build_client(api_id, api_hash, string_session)
     await client.start()
@@ -145,125 +202,18 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
     # ── .dl HANDLER ──────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.dl$"))
     async def dl_handler(event):
-        if not is_subscribed(user_id):
-            await event.client.send_message("me", "❌ Akses `.dl` membutuhkan langganan VIP aktif.")
-            return
-        await event.delete()
-        if not event.is_reply:
-            return
-        replied = await event.get_reply_message()
-        if not replied or not replied.media:
+        # ── DEDUP CHECK: tolak jika event ini sudah pernah diproses ──
+        if _dl_dedup_check(user_id, event.id):
             return
 
-        sender = await replied.get_sender()
-        if sender:
-            first   = getattr(sender, "first_name", "") or ""
-            last    = getattr(sender, "last_name", "") or ""
-            display = escape_md((f"{first} {last}").strip() or "Unknown")
-            mention = f"[{display}](tg://user?id={sender.id})"
-        else:
-            mention = "Unknown"
-        chat       = await event.get_chat()
-        chat_title = escape_md(getattr(chat, "title", None) or "Private Chat")
-        caption    = f"📥 **Dari:** {mention}\n💬 **Chat:** {chat_title}"
+        # ── LOCK: pastikan hanya satu proses .dl berjalan per user ──
+        lock = dl_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            dl_locks[user_id] = lock
 
-        # Kirim notif status downloading
-        status_msg = await client.send_message("me", "⏳ Sedang mendownload media...")
-
-        # Jika BUKAN view-once dan BUKAN restricted → coba forward
-        is_view_once_media = bool(getattr(replied.media, "ttl_seconds", None))
-        if not is_view_once_media and not is_no_forward(replied):
-            try:
-                await client.forward_messages("me", replied)
-                await status_msg.edit(caption, parse_mode="markdown")
-                return  # ✔️ selesai, tidak perlu download manual
-            except Exception:
-                pass  # fallback ke download manual
-
-        # Download manual (view-once / restricted / forward gagal)
-        try:
-            media_bytes = await client.download_media(replied.media, bytes)
-        except Exception as e:
-            await status_msg.edit(f"❌ Gagal mendownload: `{e}`")
-            return
-        if not media_bytes:
-            await status_msg.delete()
-            return
-
-        file_obj = io.BytesIO(media_bytes)
-
-        if isinstance(replied.media, MessageMediaPhoto):
-            # Foto
-            file_obj.name = "photo.jpg"
-            await status_msg.delete()
-            await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
-
-        elif isinstance(replied.media, MessageMediaDocument):
-            doc  = replied.media.document
-            mime = getattr(doc, "mime_type", "") or ""
-
-            if is_sticker_doc(doc):
-                # Stiker
-                if "webp" in mime:
-                    file_obj.name = "sticker.webp"
-                elif "tgsticker" in mime or "application/x-tgsticker" in mime:
-                    file_obj.name = "sticker.tgs"
-                elif "video" in mime:
-                    file_obj.name = "sticker.webm"
-                else:
-                    file_obj.name = "sticker.webp"
-                await status_msg.delete()
-                await client.send_file("me", file=file_obj, force_document=False)
-
-            elif "video" in mime or "mp4" in mime:
-                # ⚠️ VIDEO: pakai atribut asli untuk pertahankan dimensi (aspect ratio)
-                video_attr = get_video_attributes(doc)
-                fname = get_file_name(doc) or "video.mp4"
-                file_obj.name = fname
-
-                send_attrs = []
-                if video_attr:
-                    # Buat atribut baru tanpa round_message agar tidak jadi video bulat
-                    send_attrs = [DocumentAttributeVideo(
-                        duration=video_attr.duration,
-                        w=video_attr.w,
-                        h=video_attr.h,
-                        supports_streaming=True,
-                        round_message=False,
-                    )]
-
-                await status_msg.delete()
-                await client.send_file(
-                    "me",
-                    file=file_obj,
-                    caption=caption,
-                    parse_mode="markdown",
-                    attributes=send_attrs if send_attrs else None,
-                    allow_cache=False,
-                )
-
-            else:
-                # Dokumen / audio / dll
-                fname = get_file_name(doc) or "document"
-                if "." not in fname:
-                    ext_map = {
-                        "audio/mpeg": ".mp3",
-                        "audio/ogg": ".ogg",
-                        "application/pdf": ".pdf",
-                        "video/webm": ".webm",
-                        "image/gif": ".gif",
-                    }
-                    fname += ext_map.get(mime, "")
-                file_obj.name = fname
-                await status_msg.delete()
-                await client.send_file(
-                    "me", file=file_obj,
-                    caption=caption, parse_mode="markdown",
-                    force_document=False, allow_cache=False,
-                )
-        else:
-            await status_msg.delete()
-            await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
+        async with lock:
+            await _process_dl(event, client, user_id)
 
     # ── .copy HANDLER ─────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.copy\s+(https?://t\.me/\S+)$"))
@@ -285,15 +235,12 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
         msg_id_part     = m.group("msg_id")
 
         if channel_id_part and msg_id2_part:
-            # Format t.me/c/CHANNEL_ID/MSG_ID — private/restricted channel
-            # WAJIB pakai InputPeerChannel agar Telethon bisa resolve
             try:
                 channel_entity = await client.get_entity(InputPeerChannel(
                     channel_id=int(channel_id_part),
-                    access_hash=0  # Telethon akan update access_hash otomatis dari cache
+                    access_hash=0
                 ))
             except Exception:
-                # Fallback: coba join/akses lewat PeerChannel
                 try:
                     from telethon.tl.types import PeerChannel
                     channel_entity = await client.get_entity(PeerChannel(int(channel_id_part)))
@@ -306,7 +253,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                     return
             msg_id = int(msg_id2_part)
         elif username_part and msg_id_part:
-            # Format t.me/username/MSG_ID — public channel
             channel_entity = username_part
             msg_id = int(msg_id_part)
         else:
@@ -328,7 +274,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             await status_msg.edit("❌ Pesan tidak ditemukan.")
             return
 
-        # Teks saja
         if not msg.media:
             text_content = msg.text or msg.message or ""
             if text_content:
@@ -337,7 +282,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                 await status_msg.edit("⚠️ Pesan kosong atau tidak ada konten.")
             return
 
-        # Coba forward (lebih cepat)
         if not is_no_forward(msg):
             try:
                 await client.forward_messages("me", msg)
@@ -348,7 +292,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
 
         await status_msg.edit("⏳ Sedang mendownload media...")
 
-        # Download manual
         try:
             if isinstance(msg.media, MessageMediaPhoto):
                 media_bytes = await client.download_media(msg.media, bytes)
@@ -369,10 +312,10 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                     media_bytes = await client.download_media(msg.media, bytes)
                     if media_bytes:
                         file_obj = io.BytesIO(media_bytes)
-                        if "webp" in mime:            file_obj.name = "sticker.webp"
-                        elif "tgsticker" in mime:     file_obj.name = "sticker.tgs"
-                        elif "video" in mime:         file_obj.name = "sticker.webm"
-                        else:                          file_obj.name = "sticker.webp"
+                        if "webp" in mime:        file_obj.name = "sticker.webp"
+                        elif "tgsticker" in mime: file_obj.name = "sticker.tgs"
+                        elif "video" in mime:     file_obj.name = "sticker.webm"
+                        else:                      file_obj.name = "sticker.webp"
                         await status_msg.delete()
                         await client.send_file("me", file=file_obj, force_document=False)
 
@@ -408,10 +351,10 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                     if "." not in fname:
                         ext_map = {
                             "audio/mpeg": ".mp3",
-                            "audio/ogg": ".ogg",
+                            "audio/ogg":  ".ogg",
                             "application/pdf": ".pdf",
                             "video/webm": ".webm",
-                            "image/gif": ".gif",
+                            "image/gif":  ".gif",
                         }
                         fname += ext_map.get(mime, "")
                     media_bytes = await client.download_media(msg.media, bytes)
@@ -440,6 +383,116 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
     active_clients[user_id] = client
     print(f"✅ Client aktif untuk user {user_id}")
     asyncio.ensure_future(client.run_until_disconnected())
+
+
+async def _process_dl(event, client, user_id):
+    """Logika utama .dl, dipanggil setelah dedup & lock."""
+    if not is_subscribed(user_id):
+        await event.client.send_message("me", "❌ Akses `.dl` membutuhkan langganan VIP aktif.")
+        return
+    await event.delete()
+    if not event.is_reply:
+        return
+    replied = await event.get_reply_message()
+    if not replied or not replied.media:
+        return
+
+    sender = await replied.get_sender()
+    if sender:
+        first   = getattr(sender, "first_name", "") or ""
+        last    = getattr(sender, "last_name", "") or ""
+        display = escape_md((f"{first} {last}").strip() or "Unknown")
+        mention = f"[{display}](tg://user?id={sender.id})"
+    else:
+        mention = "Unknown"
+    chat       = await event.get_chat()
+    chat_title = escape_md(getattr(chat, "title", None) or "Private Chat")
+    caption    = f"📥 **Dari:** {mention}\n💬 **Chat:** {chat_title}"
+
+    status_msg = await client.send_message("me", "⏳ Sedang mendownload media...")
+
+    is_view_once_media = bool(getattr(replied.media, "ttl_seconds", None))
+
+    # Jika BUKAN view-once dan BUKAN restricted → forward saja
+    if not is_view_once_media and not is_no_forward(replied):
+        try:
+            await client.forward_messages("me", replied)
+            await status_msg.edit(caption, parse_mode="markdown")
+            return  # ✔️ selesai
+        except Exception:
+            pass  # fallback ke download manual
+
+    # Download manual
+    try:
+        media_bytes = await client.download_media(replied.media, bytes)
+    except Exception as e:
+        await status_msg.edit(f"❌ Gagal mendownload: `{e}`")
+        return
+    if not media_bytes:
+        await status_msg.delete()
+        return
+
+    file_obj = io.BytesIO(media_bytes)
+
+    if isinstance(replied.media, MessageMediaPhoto):
+        file_obj.name = "photo.jpg"
+        await status_msg.delete()
+        await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
+
+    elif isinstance(replied.media, MessageMediaDocument):
+        doc  = replied.media.document
+        mime = getattr(doc, "mime_type", "") or ""
+
+        if is_sticker_doc(doc):
+            if "webp" in mime:        file_obj.name = "sticker.webp"
+            elif "tgsticker" in mime: file_obj.name = "sticker.tgs"
+            elif "video" in mime:     file_obj.name = "sticker.webm"
+            else:                      file_obj.name = "sticker.webp"
+            await status_msg.delete()
+            await client.send_file("me", file=file_obj, force_document=False)
+
+        elif "video" in mime or "mp4" in mime:
+            video_attr = get_video_attributes(doc)
+            fname      = get_file_name(doc) or "video.mp4"
+            file_obj.name = fname
+            send_attrs = []
+            if video_attr:
+                send_attrs = [DocumentAttributeVideo(
+                    duration=video_attr.duration,
+                    w=video_attr.w,
+                    h=video_attr.h,
+                    supports_streaming=True,
+                    round_message=False,
+                )]
+            await status_msg.delete()
+            await client.send_file(
+                "me", file=file_obj,
+                caption=caption, parse_mode="markdown",
+                attributes=send_attrs if send_attrs else None,
+                allow_cache=False,
+            )
+
+        else:
+            fname = get_file_name(doc) or "document"
+            if "." not in fname:
+                ext_map = {
+                    "audio/mpeg": ".mp3",
+                    "audio/ogg":  ".ogg",
+                    "application/pdf": ".pdf",
+                    "video/webm": ".webm",
+                    "image/gif":  ".gif",
+                }
+                fname += ext_map.get(mime, "")
+            file_obj.name = fname
+            await status_msg.delete()
+            await client.send_file(
+                "me", file=file_obj,
+                caption=caption, parse_mode="markdown",
+                force_document=False, allow_cache=False,
+            )
+    else:
+        await status_msg.delete()
+        await client.send_file("me", file=file_obj, caption=caption, parse_mode="markdown")
 
 
 # ── POST INIT ─────────────────────────────────────────────────────
@@ -488,15 +541,27 @@ def _find_subscribed_user(target_str: str):
 
 
 async def _do_gift(target_str: str, days: int, context) -> tuple:
-    target_id = _resolve_target(target_str)
-    if target_id is None:
-        return False, (
-            f"❌ User `{target_str}` tidak ditemukan di database.\n\n"
-            "Pastikan user sudah pernah membuka bot (/start) agar username-nya tercatat,\n"
-            "atau gunakan *user\_id* (angka) langsung."
-        )
+    clean = target_str.lstrip("@")
+
+    if clean.isdigit():
+        # ✔️ Langsung pakai user_id — tidak perlu user pernah /start
+        target_id = int(clean)
+    else:
+        # Cari by username di DB
+        target_id = get_user_by_username(clean)
+        if target_id is None:
+            return False, (
+                f"❌ Username `@{clean}` tidak ditemukan di database.\n\n"
+                f"💡 *Tips:* Gunakan *user\_id* (angka) agar bisa gift tanpa user perlu /start dulu.\n"
+                f"User\_id bisa didapat dari @userinfobot atau forward pesan user ke @getidsbot."
+            )
+
+    # Pastikan ada di tabel users (insert minimal jika belum ada)
     upsert_user(target_id, None, None)
     expired = activate_subscription(target_id, days=days)
+
+    # Coba kirim notif ke user (mungkin gagal jika user belum start bot)
+    notif_sent = False
     try:
         await context.bot.send_message(
             chat_id=target_id,
@@ -504,15 +569,19 @@ async def _do_gift(target_str: str, days: int, context) -> tuple:
                 f"🎁 *Selamat! VIP kamu telah diaktifkan!*\n\n"
                 f"📅 Aktif hingga: *{expired.strftime('%d %b %Y')}*\n"
                 f"⏳ Durasi: *{days} hari*\n\n"
-                f"Gunakan /start untuk melihat status langganan kamu."
+                f"Gunakan /start untuk melihat fitur VIP."
             ),
             parse_mode="Markdown"
         )
+        notif_sent = True
     except Exception:
         pass
+
+    notif_info = "" if notif_sent else "\n\u26a0\ufe0f _Notifikasi ke user gagal dikirim (user belum pernah start bot)._"
     return True, (
         f"🎁 VIP berhasil diberikan ke `{target_id}` selama *{days} hari*\n"
         f"Aktif hingga: *{expired.strftime('%d %b %Y')}*"
+        f"{notif_info}"
     )
 
 
@@ -529,15 +598,18 @@ async def _do_revoke(target_str: str, context) -> tuple:
             "Mungkin VIP sudah pernah dicabut sebelumnya."
         )
     revoke_subscription(target_id)
+    notif_sent = False
     try:
         await context.bot.send_message(
             chat_id=target_id,
             text="🚫 *VIP kamu telah dicabut oleh admin.* Hubungi admin jika ada pertanyaan.",
             parse_mode="Markdown"
         )
+        notif_sent = True
     except Exception:
         pass
-    return True, f"✅ VIP user `{target_id}` berhasil dicabut."
+    notif_info = "" if notif_sent else "\n⚠️ _Notifikasi ke user gagal dikirim._"
+    return True, f"✅ VIP user `{target_id}` berhasil dicabut.{notif_info}"
 
 
 # ── ADMIN MESSAGE HANDLER (group=0) ───────────────────────────────
@@ -860,15 +932,7 @@ async def _finish_setup(update, uid, data, client):
     temp_store.pop(uid, None)
     await update.message.reply_text(
         "✅ *Setup berhasil! Session kamu sudah aktif.*\n\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "📌 *Cara pakai fitur VIP:*\n\n"
-        "🔹 *Download media view-once / restricted:*\n"
-        "Reply pesan yang ingin di-download, lalu ketik `.dl`\n"
-        "_(Media akan dikirim ke Saved Messages kamu)_\n\n"
-        "🔹 *Copy konten dari channel restricted:*\n"
-        "Ketik `.copy` + link pesan\n"
-        "Contoh: `.copy https://t.me/channelname/123`\n"
-        "_(Konten akan dikirim ke Saved Messages kamu)_",
+        "Gunakan tombol *📖 Cara Penggunaan* di menu utama untuk panduan lengkap fitur VIP.",
         parse_mode="Markdown",
         reply_markup=main_keyboard(uid)
     )
@@ -907,6 +971,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📱 Gunakan /setup untuk mengatur session Telegram kamu.",
             reply_markup=main_keyboard(uid)
         )
+    elif data == "menu_guide":
+        await query.edit_message_text(
+            GUIDE_TEXT,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Kembali", callback_data="menu_back")]
+            ])
+        )
     elif data == "menu_admin":
         if uid != ADMIN_ID:
             return
@@ -918,8 +990,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting_gift.discard(uid)
         waiting_revoke.discard(uid)
         waiting_restore.discard(uid)
+        session = get_user_session(uid)
+        client  = active_clients.get(uid)
+        if session and client and client.is_connected():
+            status = "✅ *Aktif*"
+        elif session:
+            status = "⚠️ *Session tersimpan, client belum terhubung*"
+        else:
+            status = "❌ *Belum diatur*"
+        if is_subscribed(uid):
+            info       = get_subscription_info(uid)
+            expired    = datetime.fromisoformat(info[1])
+            sub_status = f"\n💳 Langganan: ✅ Aktif s/d *{expired.strftime('%d %b %Y')}*"
+        else:
+            sub_status = "\n💳 Langganan: ❌ Belum berlangganan"
         await query.edit_message_text(
-            "👋 *Menu Utama*\n\nPilih menu di bawah:",
+            f"👋 *Selamat datang di Rams VIP Bot!*\n\nStatus session: {status}{sub_status}\n\nPilih menu di bawah:",
             parse_mode="Markdown", reply_markup=main_keyboard(uid)
         )
     elif data == "admin_backup":
@@ -941,8 +1027,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`<user_id> [days]` atau `@username [days]`\n\n"
             "Contoh: `123456789 30` atau `@johndoe 30`\n"
             "_(Default 30 hari jika tidak diisi)_\n\n"
-            "💡 *Tips:* Gunakan user\_id (angka) untuk hasil lebih pasti.\n"
-            "User\_id bisa dilihat dari bot seperti @userinfobot\n\n"
+            "💡 *Tips:* Gunakan *user\_id* (angka) agar bisa gift tanpa user perlu\n"
+            "klik /start dulu. User\_id bisa dari @userinfobot atau @getidsbot.\n\n"
             "_/cancel untuk batal._",
             parse_mode="Markdown"
         )
@@ -957,11 +1043,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Cara menggunakan:*\n"
             "Kirim user\_id atau @username pengguna yang ingin dicabut VIP-nya.\n\n"
             "Contoh:\n"
-            "\u2022 `123456789` _(user\_id, lebih disarankan)_\n"
+            "\u2022 `123456789` _(user\_id, paling disarankan)_\n"
             "\u2022 `@johndoe` _(username, harus sudah pernah /start)_\n\n"
-            "💡 *Tips:* Gunakan user\_id (angka) agar selalu berhasil meskipun\n"
-            "pengguna mengganti username-nya.\n"
-            "User\_id bisa dilihat dari log gift VIP sebelumnya.\n\n"
+            "💡 *Tips:* Revoke by user\_id selalu berhasil walau user belum /start.\n\n"
             "_/cancel untuk batal._",
             parse_mode="Markdown"
         )
