@@ -316,15 +316,37 @@ async def post_init(app):
 
 # ── ADMIN HELPERS ─────────────────────────────────────────────────
 def _resolve_target(target_str: str):
-    if target_str.lstrip("@").isdigit() and not target_str.startswith("@"):
-        return int(target_str)
-    return get_user_by_username(target_str)
+    """Resolve user_id dari string. Prioritas: angka langsung, lalu cari by username."""
+    clean = target_str.lstrip("@")
+    if clean.isdigit():
+        return int(clean)
+    # Coba cari by username di tabel users
+    return get_user_by_username(clean)
+
+
+def _find_subscribed_user(target_str: str):
+    """
+    Resolve target untuk revoke.
+    Jika angka: langsung cek di tabel subscriptions (tidak perlu ada di tabel users).
+    Jika username: cari di tabel users dulu.
+    """
+    clean = target_str.lstrip("@")
+    if clean.isdigit():
+        # Langsung pakai angka, tidak perlu cek tabel users
+        return int(clean)
+    # Cari by username
+    return get_user_by_username(clean)
 
 
 async def _do_gift(target_str: str, days: int, context) -> tuple:
     target_id = _resolve_target(target_str)
     if target_id is None:
-        return False, f"❌ User `{target_str}` tidak ditemukan di database."
+        return False, (
+            f"❌ User `{target_str}` tidak ditemukan di database.\n\n"
+            "Pastikan user sudah pernah membuka bot (/start) agar username-nya tercatat,\n"
+            "atau gunakan *user\_id* (angka) langsung."
+        )
+    # Pastikan user ada di tabel users sebelum insert subscriptions
     upsert_user(target_id, None, None)
     expired = activate_subscription(target_id, days=days)
     try:
@@ -347,11 +369,18 @@ async def _do_gift(target_str: str, days: int, context) -> tuple:
 
 
 async def _do_revoke(target_str: str, context) -> tuple:
-    target_id = _resolve_target(target_str)
+    # Gunakan _find_subscribed_user agar revoke by user_id tidak bergantung tabel users
+    target_id = _find_subscribed_user(target_str)
     if target_id is None:
-        return False, f"❌ User `{target_str}` tidak ditemukan di database."
+        return False, (
+            f"❌ User `{target_str}` tidak ditemukan.\n\n"
+            "Gunakan *user\_id* (angka) jika username tidak terdaftar."
+        )
     if not is_subscribed(target_id):
-        return False, f"⚠️ User `{target_id}` tidak memiliki langganan VIP aktif."
+        return False, (
+            f"⚠️ User `{target_id}` tidak memiliki langganan VIP aktif.\n\n"
+            "Mungkin VIP sudah pernah dicabut sebelumnya."
+        )
     revoke_subscription(target_id)
     try:
         await context.bot.send_message(
@@ -364,13 +393,13 @@ async def _do_revoke(target_str: str, context) -> tuple:
     return True, f"✅ VIP user `{target_id}` berhasil dicabut."
 
 
-# ── ADMIN MESSAGE HANDLER (group=0, prioritas tertinggi) ──────────
+# ── ADMIN MESSAGE HANDLER (group=0) ───────────────────────────────
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Hanya proses jika admin sedang dalam waiting state
-    # Jika tidak dalam waiting state, biarkan handler lain yang tangani
     uid = update.effective_user.id
     if uid != ADMIN_ID:
         return
+    # Hanya proses jika admin sedang dalam waiting state
+    # Jika tidak, biarkan handler lain (ConversationHandler, dll) yang handle
     if uid not in waiting_gift and uid not in waiting_revoke and uid not in waiting_restore:
         return
 
@@ -430,7 +459,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     user = update.effective_user
 
-    # Selalu bersihkan semua waiting state saat /start
+    # Selalu bersihkan semua waiting state & temp saat /start
     waiting_gift.discard(uid)
     waiting_revoke.discard(uid)
     waiting_restore.discard(uid)
@@ -522,17 +551,17 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Proses ini menghubungkan akun Telegram kamu ke bot.\n"
         "Ketik /cancel kapan saja untuk membatalkan.\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "*Langkah 1 dari 5 — API ID*\n\n"
-        "API ID adalah kode angka unik untuk aplikasi Telegram buatanmu.\n\n"
+        "*Langkah 1 dari 5 \u2014 API ID*\n\n"
+        "API ID adalah kode angka unik milik aplikasi Telegram buatanmu.\n\n"
         "📌 *Cara mendapatkan API ID:*\n"
-        "1\\. Buka https://my\\.telegram\\.org di browser\n"
-        "2\\. Login dengan nomor HP Telegram kamu\n"
-        "3\\. Masukkan kode OTP yang dikirim ke Telegram\n"
-        "4\\. Klik *API development tools*\n"
-        "5\\. Isi form \\(nama & platform bebas\\), lalu klik *Create application*\n"
-        "6\\. Salin angka di kolom *App api\\_id*\n\n"
+        "1. Buka https://my.telegram.org di browser\n"
+        "2. Login dengan nomor HP Telegram kamu\n"
+        "3. Masukkan kode OTP yang dikirim ke Telegram\n"
+        "4. Klik *API development tools*\n"
+        "5. Isi form (nama & platform bebas), klik *Create application*\n"
+        "6. Salin angka di kolom *App api\_id*\n\n"
         "Kirim angka tersebut di sini:",
-        parse_mode="MarkdownV2"
+        parse_mode="Markdown"
     )
     return API_ID_STEP
 
@@ -543,8 +572,7 @@ async def setup_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text.isdigit():
         await update.message.reply_text(
             "❌ API ID harus berupa *angka saja*, bukan huruf.\n\n"
-            "Contoh yang benar: `12345678`\n\n"
-            "Coba kirim ulang:",
+            "Contoh yang benar: `12345678`\n\nCoba kirim ulang:",
             parse_mode="Markdown"
         )
         return API_ID_STEP
@@ -552,12 +580,12 @@ async def setup_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ API ID tersimpan!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "*Langkah 2 dari 5 — API Hash*\n\n"
+        "*Langkah 2 dari 5 \u2014 API Hash*\n\n"
         "API Hash adalah kode acak 32 karakter (campuran huruf & angka).\n\n"
         "📌 *Cara mendapatkan API Hash:*\n"
-        "Di halaman yang sama (my.telegram.org → API development tools),\n"
-        "salin teks panjang di kolom *App api\\_hash*\n\n"
-        "Contoh: `a1b2c3d4e5f6...` _(32 karakter)_\n\n"
+        "Di halaman yang sama (my.telegram.org \u2192 API development tools),\n"
+        "salin teks panjang di kolom *App api\_hash*\n\n"
+        "Contoh tampilan: `a1b2c3d4e5f6g7h8i9j0...` _(32 karakter)_\n\n"
         "Kirim API Hash kamu di sini:",
         parse_mode="Markdown"
     )
@@ -580,12 +608,12 @@ async def setup_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ API Hash tersimpan!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "*Langkah 3 dari 5 — Nomor HP*\n\n"
+        "*Langkah 3 dari 5 \u2014 Nomor HP*\n\n"
         "Masukkan nomor HP yang terdaftar di akun Telegram kamu.\n\n"
         "📌 *Format yang benar:*\n"
-        "• Awali dengan kode negara\n"
-        "• Indonesia: `+628xxxxxxxxxx`\n"
-        "• Contoh: `+6281234567890`\n\n"
+        "\u2022 Awali dengan kode negara\n"
+        "\u2022 Indonesia: `+628xxxxxxxxxx`\n"
+        "\u2022 Contoh: `+6281234567890`\n\n"
         "Kirim nomor HP kamu:",
         parse_mode="Markdown"
     )
@@ -606,13 +634,13 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📨 Kode OTP berhasil dikirim ke Telegram kamu!\n\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "*Langkah 4 dari 5 — Kode OTP*\n\n"
+            "*Langkah 4 dari 5 \u2014 Kode OTP*\n\n"
             "Buka aplikasi Telegram kamu, cari pesan dari *Telegram* "
             "yang berisi 5 digit kode verifikasi.\n\n"
             "📌 *Cara mengirim kode:*\n"
             "Ketik kode dengan *spasi di antara setiap angka*\n\n"
             "Contoh: jika kode kamu `12345`, kirim: `1 2 3 4 5`\n\n"
-            "_(Spasi wajib, agar Telegram tidak mendeteksi sebagai aktivitas mencurigakan)_",
+            "_(Spasi wajib agar Telegram tidak mendeteksi sebagai aktivitas mencurigakan)_",
             parse_mode="Markdown"
         )
         return CODE_STEP
@@ -622,8 +650,8 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Gagal mengirim OTP: `{e}`\n\n"
             "Kemungkinan penyebab:\n"
-            "• Nomor HP salah format (harus pakai +62...)\n"
-            "• API ID atau API Hash salah\n\n"
+            "\u2022 Nomor HP salah format (harus pakai +62...)\n"
+            "\u2022 API ID atau API Hash salah\n\n"
             "Silakan /setup ulang dari awal.",
             parse_mode="Markdown", reply_markup=main_keyboard(uid)
         )
@@ -641,10 +669,10 @@ async def setup_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🔐 *Akun ini mengaktifkan verifikasi 2 langkah (2FA)*\n\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "*Langkah 5 dari 5 — Password 2FA*\n\n"
+            "*Langkah 5 dari 5 \u2014 Password 2FA*\n\n"
             "Masukkan password 2FA Telegram kamu.\n\n"
             "📌 Ini adalah password yang kamu buat sendiri di:\n"
-            "Telegram → Pengaturan → Privasi & Keamanan → Verifikasi 2 Langkah\n\n"
+            "Telegram \u2192 Pengaturan \u2192 Privasi & Keamanan \u2192 Verifikasi 2 Langkah\n\n"
             "Kirim password kamu:",
             parse_mode="Markdown"
         )
@@ -677,7 +705,7 @@ async def setup_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
         temp_store.pop(uid, None)
         await update.message.reply_text(
-            f"❌ Password 2FA salah: `{e}`\n\nSilakan /setup ulang.",
+            f"❌ Password 2FA salah: `{e}`\nSilakan /setup ulang.",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
@@ -746,7 +774,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
     elif data == "menu_back":
-        # Bersihkan waiting state
         waiting_gift.discard(uid)
         waiting_revoke.discard(uid)
         waiting_restore.discard(uid)
@@ -772,7 +799,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kirim target dalam format:\n"
             "`<user_id> [days]` atau `@username [days]`\n\n"
             "Contoh: `123456789 30` atau `@johndoe 30`\n"
-            "_(Default 30 hari jika tidak diisi)_\n\n_/cancel untuk batal._",
+            "_(Default 30 hari jika tidak diisi)_\n\n"
+            "💡 *Tips:* Gunakan user\_id (angka) untuk hasil lebih pasti.\n"
+            "User\_id bisa dilihat dari bot seperti @userinfobot\n\n"
+            "_/cancel untuk batal._",
             parse_mode="Markdown"
         )
     elif data == "admin_revoke":
@@ -780,8 +810,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting_revoke.add(ADMIN_ID)
         await query.edit_message_text(
             "🚫 *Revoke VIP*\n\n"
-            "Kirim user_id atau @username yang ingin dicabut VIP-nya:\n\n"
-            "Contoh: `123456789` atau `@johndoe`\n\n_/cancel untuk batal._",
+            "Fitur ini akan *mencabut* langganan VIP milik pengguna.\n"
+            "Pengguna tidak akan bisa menggunakan fitur `.dl` dan `.copy` lagi.\n\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "*Cara menggunakan:*\n"
+            "Kirim user\_id atau @username pengguna yang ingin dicabut VIP-nya.\n\n"
+            "Contoh:\n"
+            "\u2022 `123456789` _(user\_id, lebih disarankan)_\n"
+            "\u2022 `@johndoe` _(username, harus sudah pernah /start)_\n\n"
+            "💡 *Tips:* Gunakan user\_id (angka) agar selalu berhasil meskipun\n"
+            "pengguna mengganti username-nya.\n"
+            "User\_id bisa dilihat dari log gift VIP sebelumnya.\n\n"
+            "_/cancel untuk batal._",
             parse_mode="Markdown"
         )
 
@@ -851,6 +891,7 @@ def main():
         .build()
     )
 
+    # ── SETUP CONVERSATION HANDLER ─────────────────────────────
     setup_conv = ConversationHandler(
         entry_points=[CommandHandler("setup", cmd_setup)],
         states={
@@ -867,10 +908,16 @@ def main():
         allow_reentry=True,
     )
 
-    # ⚠️ PENTING: admin_message_handler di group=0
-    # Hanya aktif jika admin dalam waiting state (gift/revoke/restore)
-    # Jika tidak dalam waiting state, handler ini langsung return
-    # sehingga pesan diteruskan ke handler lain (group=1)
+    # ── REGISTRASI HANDLER ─────────────────────────────────────
+    # group=0: admin_message_handler (hanya aktif saat waiting state)
+    # group=0 juga: semua CommandHandler & CallbackQueryHandler
+    # group=1: setup_conv (ConversationHandler)
+    #
+    # KENAPA setup_conv di group=1?
+    # ConversationHandler di group=0 bisa konflik dengan CommandHandler lain.
+    # Dengan group=1, ConversationHandler tetap berjalan paralel.
+    # CommandHandler di group=0 selalu diproses, termasuk /start di dalam fallbacks.
+
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & filters.User(ADMIN_ID),
@@ -879,12 +926,13 @@ def main():
         group=0
     )
 
+    app.add_handler(setup_conv, group=1)
+
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("gift",   cmd_gift))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(setup_conv, group=1)
 
     print("🤖 Rams VIP Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
