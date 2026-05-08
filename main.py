@@ -126,6 +126,24 @@ def _clear_user_state(uid: int):
     waiting_revoke.discard(uid)
 
 
+async def stop_client_for_user(user_id: int):
+    """
+    Disconnect dan hapus client Telethon untuk user tertentu.
+    Dipanggil saat VIP direvoke atau expired.
+    """
+    client = active_clients.pop(user_id, None)
+    if client:
+        try:
+            if client.is_connected():
+                await client.disconnect()
+            print(f"🔴 Client dihentikan untuk user {user_id} (VIP tidak aktif)")
+        except Exception as e:
+            print(f"⚠️ Gagal disconnect client user {user_id}: {e}")
+    # Bersihkan dedup & lock
+    dl_locks.pop(user_id, None)
+    dl_seen.pop(user_id, None)
+
+
 def main_keyboard(uid):
     rows = [
         [InlineKeyboardButton("⚙️ Setup Session", callback_data="menu_setup")],
@@ -200,6 +218,16 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.dl$"))
     async def dl_handler(event):
+        # Cek VIP setiap kali event masuk (menangkap expired real-time)
+        if not is_subscribed(user_id):
+            await stop_client_for_user(user_id)
+            await event.client.send_message(
+                "me",
+                "❌ Langganan VIP kamu sudah habis atau dicabut.\n"
+                "Hubungi admin untuk memperpanjang."
+            )
+            return
+
         if _dl_dedup_check(user_id, event.id):
             return
         lock = dl_locks.get(user_id)
@@ -211,8 +239,14 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.copy\s+(https?://t\.me/\S+)$"))
     async def copy_handler(event):
+        # Cek VIP setiap kali event masuk (menangkap expired real-time)
         if not is_subscribed(user_id):
-            await event.client.send_message("me", "❌ Akses .copy membutuhkan langganan VIP aktif.")
+            await stop_client_for_user(user_id)
+            await event.client.send_message(
+                "me",
+                "❌ Langganan VIP kamu sudah habis atau dicabut.\n"
+                "Hubungi admin untuk memperpanjang."
+            )
             return
         await event.delete()
 
@@ -379,7 +413,12 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
 
 async def _process_dl(event, client, user_id):
     if not is_subscribed(user_id):
-        await event.client.send_message("me", "❌ Akses .dl membutuhkan langganan VIP aktif.")
+        await stop_client_for_user(user_id)
+        await event.client.send_message(
+            "me",
+            "❌ Langganan VIP kamu sudah habis atau dicabut.\n"
+            "Hubungi admin untuk memperpanjang."
+        )
         return
     await event.delete()
     if not event.is_reply:
@@ -507,10 +546,15 @@ async def post_init(app):
         return
     print(f"🔄 Memuat {len(rows)} session tersimpan...")
     for row in rows:
+        user_id = row[0]
+        # Hanya load session jika VIP masih aktif
+        if not is_subscribed(user_id):
+            print(f"⏭️ Skip session user {user_id} (VIP tidak aktif)")
+            continue
         try:
-            await start_client_for_user(row[0], row[1], row[2], row[3])
+            await start_client_for_user(user_id, row[1], row[2], row[3])
         except Exception as e:
-            print(f"⚠️ Gagal load session user {row[0]}: {e}")
+            print(f"⚠️ Gagal load session user {user_id}: {e}")
     print("✅ Semua session berhasil dimuat!")
 
 
@@ -547,7 +591,7 @@ async def _do_gift(target_str: str, days: int, context) -> tuple:
                 f"🎁 Selamat! VIP kamu telah diaktifkan!\n\n"
                 f"📅 Aktif hingga: {expired.strftime('%d %b %Y')}\n"
                 f"⏳ Durasi: {days} hari\n\n"
-                f"Ketik /start untuk melihat fitur VIP."
+                f"Ketik /start untuk melihat status VIP kamu."
             )
         )
         notif_sent = True
@@ -575,17 +619,25 @@ async def _do_revoke(target_str: str, context) -> tuple:
             "Mungkin VIP sudah pernah dicabut sebelumnya."
         )
     revoke_subscription(target_id)
+
+    # Langsung stop client Telethon user tersebut
+    await stop_client_for_user(target_id)
+
     notif_sent = False
     try:
         await context.bot.send_message(
             chat_id=target_id,
-            text="🚫 VIP kamu telah dicabut oleh admin. Hubungi admin jika ada pertanyaan."
+            text=(
+                "🚫 VIP kamu telah dicabut oleh admin.\n\n"
+                "Fitur .dl dan .copy tidak lagi bisa digunakan.\n"
+                "Hubungi admin jika ada pertanyaan."
+            )
         )
         notif_sent = True
     except Exception:
         pass
     notif_info = "" if notif_sent else "\n⚠️ Notifikasi ke user gagal dikirim."
-    return True, f"✅ VIP user {target_id} berhasil dicabut.{notif_info}"
+    return True, f"✅ VIP user {target_id} berhasil dicabut. Client langsung dihentikan.{notif_info}"
 
 
 # ── ADMIN MESSAGE HANDLER (group=2) ───────────────────────────────
@@ -668,7 +720,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expired    = datetime.fromisoformat(info[1])
         sub_status = f"\n💳 Langganan: ✅ Aktif s/d *{expired.strftime('%d %b %Y')}*"
     else:
-        sub_status = "\n💳 Langganan: ❌ Belum berlangganan"
+        sub_status = "\n💳 Langganan: ❌ Tidak aktif"
     await update.message.reply_text(
         f"👋 *Selamat datang di Rams VIP Bot!*\n\nStatus session: {status}{sub_status}\n\nPilih menu di bawah:",
         parse_mode="Markdown",
@@ -965,7 +1017,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 expired    = datetime.fromisoformat(info[1])
                 sub_status = f"\n💳 Langganan: ✅ Aktif s/d *{expired.strftime('%d %b %Y')}*"
             else:
-                sub_status = "\n💳 Langganan: ❌ Belum berlangganan"
+                sub_status = "\n💳 Langganan: ❌ Tidak aktif"
             await query.edit_message_text(
                 f"👋 *Selamat datang di Rams VIP Bot!*\n\nStatus session: {status}{sub_status}\n\nPilih menu di bawah:",
                 parse_mode="Markdown",
@@ -1099,14 +1151,9 @@ def main():
         allow_reentry=True,
     )
 
-    # group=0: prioritas tertinggi
     app.add_handler(CommandHandler("start",  cmd_start),  group=0)
     app.add_handler(CommandHandler("cancel", cmd_cancel), group=0)
-
-    # group=1: ConversationHandler setup
     app.add_handler(setup_conv, group=1)
-
-    # group=2: admin message handler
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & filters.User(ADMIN_ID),
@@ -1114,8 +1161,6 @@ def main():
         ),
         group=2
     )
-
-    # group=3: command & callback lainnya
     app.add_handler(CommandHandler("revoke", cmd_revoke), group=3)
     app.add_handler(CommandHandler("gift",   cmd_gift),   group=3)
     app.add_handler(CallbackQueryHandler(callback_handler), group=3)
