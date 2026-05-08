@@ -25,7 +25,7 @@ from database import (
     get_user_by_username
 )
 
-# ── ENV VARS ──────────────────────────────────────────────────────
+# ENV VARS
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
 ADMIN_ID    = int(os.environ["ADMIN_ID"])
 
@@ -44,10 +44,8 @@ waiting_revoke  = set()
 temp_store     = {}
 active_clients = {}
 
-# ── DEDUP & LOCK: mencegah .dl diproses dua kali ──────────────────────
-# Key: user_id → asyncio.Lock (satu proses .dl dalam satu waktu per user)
+# DEDUP & LOCK: mencegah .dl diproses dua kali
 dl_locks: dict[int, asyncio.Lock] = {}
-# Key: user_id → set of event.id yang sudah diproses (TTL manual: max 50 item)
 dl_seen:  dict[int, set]          = {}
 
 
@@ -110,20 +108,23 @@ def get_file_name(doc):
 
 
 def _dl_dedup_check(user_id: int, event_id: int) -> bool:
-    """
-    Return True jika event ini SUDAH diproses (duplikat), False jika belum.
-    Otomatis batasi ukuran set ke 50 entry.
-    """
     seen = dl_seen.setdefault(user_id, set())
     if event_id in seen:
-        return True  # duplikat!
+        return True
     seen.add(event_id)
     if len(seen) > 50:
-        # Buang separuh entry terlama
         to_remove = list(seen)[:25]
         for x in to_remove:
             seen.discard(x)
     return False
+
+
+def _clear_user_state(uid: int):
+    """Reset semua state untuk user: temp_store, waiting sets."""
+    temp_store.pop(uid, None)
+    waiting_restore.discard(uid)
+    waiting_gift.discard(uid)
+    waiting_revoke.discard(uid)
 
 
 def main_keyboard(uid):
@@ -157,31 +158,31 @@ def admin_keyboard():
 GUIDE_TEXT = (
     "📖 *Panduan Penggunaan Rams VIP Bot*\n\n"
     "━━━━━━━━━━━━━━━━━\n"
-    "🔹 *Command `.dl` \u2014 Download Media*\n"
-    "Digunakan untuk mendownload media *view-once* (sekali lihat) atau "
-    "media dari chat *restricted* yang tidak bisa di-forward.\n\n"
+    "🔹 *Command .dl \u2014 Download Media*\n"
+    "Digunakan untuk mendownload media view-once (sekali lihat) atau "
+    "media dari chat restricted yang tidak bisa di-forward.\n\n"
     "*Cara pakai:*\n"
     "1. Buka chat yang ada media view-once atau restricted\n"
-    "2. *Reply* (balas) pesan media tersebut\n"
+    "2. Reply (balas) pesan media tersebut\n"
     "3. Ketik `.dl` lalu kirim\n"
-    "4. Media akan otomatis tersimpan di *Saved Messages* kamu\n\n"
-    "⚠️ *Catatan:* Pastikan kamu sudah reply ke pesan medianya, bukan ke pesan teks biasa.\n\n"
+    "4. Media akan otomatis tersimpan di Saved Messages kamu\n\n"
+    "⚠️ Pastikan kamu sudah reply ke pesan medianya, bukan ke pesan teks biasa.\n\n"
     "━━━━━━━━━━━━━━━━━\n"
-    "🔹 *Command `.copy` \u2014 Copy dari Channel/Grup*\n"
+    "🔹 *Command .copy \u2014 Copy dari Channel/Grup*\n"
     "Digunakan untuk menyalin konten (foto, video, dokumen, teks) dari "
-    "channel atau grup yang *tidak mengizinkan forward*.\n\n"
+    "channel atau grup yang tidak mengizinkan forward.\n\n"
     "*Cara pakai:*\n"
     "1. Buka pesan yang ingin di-copy di channel/grup\n"
-    "2. Salin link pesan tersebut (klik kanan pesan \u2192 *Copy Link*)\n"
+    "2. Salin link pesan (klik kanan pesan lalu Copy Link)\n"
     "3. Ketik `.copy <link>` di chat mana saja\n"
-    "4. Konten akan dikirim ke *Saved Messages* kamu\n\n"
+    "4. Konten akan dikirim ke Saved Messages kamu\n\n"
     "*Format link yang didukung:*\n"
     "\u2022 Public: `.copy https://t.me/namaChannel/123`\n"
     "\u2022 Private: `.copy https://t.me/c/1234567890/123`\n\n"
-    "⚠️ *Catatan:* Untuk channel private, akun kamu harus sudah *bergabung* ke channel tersebut.\n\n"
+    "⚠️ Untuk channel private, akun kamu harus sudah bergabung ke channel tersebut.\n\n"
     "━━━━━━━━━━━━━━━━━\n"
     "💡 *Tips:*\n"
-    "\u2022 Semua hasil download dikirim ke *Saved Messages* (pesan tersimpan) akun Telegram kamu\n"
+    "\u2022 Semua hasil download dikirim ke Saved Messages akun Telegram kamu\n"
     "\u2022 Pastikan session sudah di-setup via /setup sebelum menggunakan fitur ini\n"
     "\u2022 Fitur ini hanya tersedia untuk pengguna VIP aktif"
 )
@@ -192,41 +193,34 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
     if old and old.is_connected():
         await old.disconnect()
 
-    # Inisialisasi lock & dedup untuk user ini
     if user_id not in dl_locks:
         dl_locks[user_id] = asyncio.Lock()
 
     client = build_client(api_id, api_hash, string_session)
     await client.start()
 
-    # ── .dl HANDLER ──────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.dl$"))
     async def dl_handler(event):
-        # ── DEDUP CHECK: tolak jika event ini sudah pernah diproses ──
         if _dl_dedup_check(user_id, event.id):
             return
-
-        # ── LOCK: pastikan hanya satu proses .dl berjalan per user ──
         lock = dl_locks.get(user_id)
         if lock is None:
             lock = asyncio.Lock()
             dl_locks[user_id] = lock
-
         async with lock:
             await _process_dl(event, client, user_id)
 
-    # ── .copy HANDLER ─────────────────────────────────────────────
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.copy\s+(https?://t\.me/\S+)$"))
     async def copy_handler(event):
         if not is_subscribed(user_id):
-            await event.client.send_message("me", "❌ Akses `.copy` membutuhkan langganan VIP aktif.")
+            await event.client.send_message("me", "❌ Akses .copy membutuhkan langganan VIP aktif.")
             return
         await event.delete()
 
         url = event.pattern_match.group(1).strip()
         m = TG_LINK_RE.match(url)
         if not m:
-            await client.send_message("me", "❌ Link tidak valid. Gunakan format: `.copy https://t.me/channel/123`")
+            await client.send_message("me", "❌ Link tidak valid. Gunakan format: .copy https://t.me/channel/123")
             return
 
         channel_id_part = m.group("channel_id")
@@ -247,8 +241,8 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                 except Exception as e:
                     await client.send_message(
                         "me",
-                        f"❌ Gagal mengakses channel `{channel_id_part}`.\n"
-                        f"Pastikan akun kamu sudah *bergabung* ke channel tersebut.\n\nError: `{e}`"
+                        f"❌ Gagal mengakses channel {channel_id_part}.\n"
+                        f"Pastikan akun kamu sudah bergabung ke channel tersebut.\n\nError: {e}"
                     )
                     return
             msg_id = int(msg_id2_part)
@@ -265,8 +259,8 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             msg = await client.get_messages(channel_entity, ids=msg_id)
         except Exception as e:
             await status_msg.edit(
-                f"❌ Gagal mengambil pesan: `{e}`\n\n"
-                f"Pastikan akun kamu sudah *bergabung* ke channel tersebut."
+                f"❌ Gagal mengambil pesan: {e}\n\n"
+                f"Pastikan akun kamu sudah bergabung ke channel tersebut."
             )
             return
 
@@ -277,7 +271,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
         if not msg.media:
             text_content = msg.text or msg.message or ""
             if text_content:
-                await status_msg.edit(f"📋 **Dari channel:**\n\n{text_content}", parse_mode="markdown")
+                await status_msg.edit(f"📋 Dari channel:\n\n{text_content}")
             else:
                 await status_msg.edit("⚠️ Pesan kosong atau tidak ada konten.")
             return
@@ -339,7 +333,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                         await status_msg.delete()
                         await client.send_file(
                             "me", file=file_obj,
-                            caption=caption, parse_mode="markdown",
+                            caption=caption,
                             attributes=send_attrs if send_attrs else None,
                             allow_cache=False,
                         )
@@ -378,7 +372,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                     await status_msg.edit("⚠️ Tipe media ini tidak didukung untuk di-copy.")
 
         except Exception as e:
-            await status_msg.edit(f"❌ Gagal mendownload media: `{e}`")
+            await status_msg.edit(f"❌ Gagal mendownload media: {e}")
 
     active_clients[user_id] = client
     print(f"✅ Client aktif untuk user {user_id}")
@@ -386,9 +380,8 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
 
 
 async def _process_dl(event, client, user_id):
-    """Logika utama .dl, dipanggil setelah dedup & lock."""
     if not is_subscribed(user_id):
-        await event.client.send_message("me", "❌ Akses `.dl` membutuhkan langganan VIP aktif.")
+        await event.client.send_message("me", "❌ Akses .dl membutuhkan langganan VIP aktif.")
         return
     await event.delete()
     if not event.is_reply:
@@ -413,20 +406,18 @@ async def _process_dl(event, client, user_id):
 
     is_view_once_media = bool(getattr(replied.media, "ttl_seconds", None))
 
-    # Jika BUKAN view-once dan BUKAN restricted → forward saja
     if not is_view_once_media and not is_no_forward(replied):
         try:
             await client.forward_messages("me", replied)
             await status_msg.edit(caption, parse_mode="markdown")
-            return  # ✔️ selesai
+            return
         except Exception:
-            pass  # fallback ke download manual
+            pass
 
-    # Download manual
     try:
         media_bytes = await client.download_media(replied.media, bytes)
     except Exception as e:
-        await status_msg.edit(f"❌ Gagal mendownload: `{e}`")
+        await status_msg.edit(f"❌ Gagal mendownload: {e}")
         return
     if not media_bytes:
         await status_msg.delete()
@@ -544,40 +535,35 @@ async def _do_gift(target_str: str, days: int, context) -> tuple:
     clean = target_str.lstrip("@")
 
     if clean.isdigit():
-        # ✔️ Langsung pakai user_id — tidak perlu user pernah /start
         target_id = int(clean)
     else:
-        # Cari by username di DB
         target_id = get_user_by_username(clean)
         if target_id is None:
             return False, (
-                f"❌ Username `@{clean}` tidak ditemukan di database.\n\n"
-                f"💡 *Tips:* Gunakan *user\_id* (angka) agar bisa gift tanpa user perlu /start dulu.\n"
-                f"User\_id bisa didapat dari @userinfobot atau forward pesan user ke @getidsbot."
+                f"❌ Username @{clean} tidak ditemukan di database.\n\n"
+                f"💡 Gunakan user ID (angka) agar bisa gift tanpa user perlu klik /start dulu.\n"
+                f"User ID bisa didapat dari @userinfobot atau forward pesan user ke @getidsbot."
             )
 
-    # Pastikan ada di tabel users (insert minimal jika belum ada)
     upsert_user(target_id, None, None)
     expired = activate_subscription(target_id, days=days)
 
-    # Coba kirim notif ke user (mungkin gagal jika user belum start bot)
     notif_sent = False
     try:
         await context.bot.send_message(
             chat_id=target_id,
             text=(
-                f"🎁 *Selamat! VIP kamu telah diaktifkan!*\n\n"
-                f"📅 Aktif hingga: *{expired.strftime('%d %b %Y')}*\n"
-                f"⏳ Durasi: *{days} hari*\n\n"
-                f"Gunakan /start untuk melihat fitur VIP."
-            ),
-            parse_mode="Markdown"
+                f"🎁 Selamat! VIP kamu telah diaktifkan!\n\n"
+                f"📅 Aktif hingga: {expired.strftime('%d %b %Y')}\n"
+                f"⏳ Durasi: {days} hari\n\n"
+                f"Ketik /start untuk melihat fitur VIP."
+            )
         )
         notif_sent = True
     except Exception:
         pass
 
-    notif_info = "" if notif_sent else "\n\u26a0\ufe0f _Notifikasi ke user gagal dikirim (user belum pernah start bot)._"
+    notif_info = "" if notif_sent else "\n\u26a0\ufe0f Notifikasi ke user gagal dikirim (user belum pernah start bot)."
     return True, (
         f"🎁 VIP berhasil diberikan ke `{target_id}` selama *{days} hari*\n"
         f"Aktif hingga: *{expired.strftime('%d %b %Y')}*"
@@ -589,12 +575,12 @@ async def _do_revoke(target_str: str, context) -> tuple:
     target_id = _find_subscribed_user(target_str)
     if target_id is None:
         return False, (
-            f"❌ User `{target_str}` tidak ditemukan.\n\n"
-            "Gunakan *user\_id* (angka) jika username tidak terdaftar."
+            f"❌ User {target_str} tidak ditemukan di database.\n\n"
+            "Gunakan user ID (angka) jika username tidak terdaftar."
         )
     if not is_subscribed(target_id):
         return False, (
-            f"⚠️ User `{target_id}` tidak memiliki langganan VIP aktif.\n\n"
+            f"⚠️ User {target_id} tidak memiliki langganan VIP aktif.\n\n"
             "Mungkin VIP sudah pernah dicabut sebelumnya."
         )
     revoke_subscription(target_id)
@@ -602,17 +588,18 @@ async def _do_revoke(target_str: str, context) -> tuple:
     try:
         await context.bot.send_message(
             chat_id=target_id,
-            text="🚫 *VIP kamu telah dicabut oleh admin.* Hubungi admin jika ada pertanyaan.",
-            parse_mode="Markdown"
+            text="🚫 VIP kamu telah dicabut oleh admin. Hubungi admin jika ada pertanyaan."
         )
         notif_sent = True
     except Exception:
         pass
-    notif_info = "" if notif_sent else "\n⚠️ _Notifikasi ke user gagal dikirim._"
+    notif_info = "" if notif_sent else "\n⚠️ Notifikasi ke user gagal dikirim."
     return True, f"✅ VIP user `{target_id}` berhasil dicabut.{notif_info}"
 
 
-# ── ADMIN MESSAGE HANDLER (group=0) ───────────────────────────────
+# ── ADMIN MESSAGE HANDLER (group=2) ───────────────────────────────
+# Sengaja group=2 agar ConversationHandler (group=1) dan
+# /cancel (group=0) selalu diproses lebih dulu.
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != ADMIN_ID:
@@ -623,7 +610,10 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if uid in waiting_restore:
         waiting_restore.discard(uid)
         if not update.message.document:
-            await update.message.reply_text("❌ Kirim file .sql yang valid.")
+            await update.message.reply_text(
+                "❌ Kirim file .sql yang valid, atau ketik /cancel untuk batal."
+            )
+            waiting_restore.add(uid)  # kembalikan state agar bisa kirim ulang
             return
         file = await context.bot.get_file(update.message.document.file_id)
         buf  = io.BytesIO()
@@ -649,7 +639,10 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         text  = update.message.text.strip() if update.message.text else ""
         parts = text.split()
         if not parts:
-            await update.message.reply_text("❌ Input tidak valid.", reply_markup=admin_keyboard())
+            await update.message.reply_text(
+                "❌ Input tidak valid. Ketik /cancel untuk batal."
+            )
+            waiting_gift.add(uid)
             return
         target_str = parts[0]
         days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
@@ -661,7 +654,10 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         waiting_revoke.discard(uid)
         text = update.message.text.strip() if update.message.text else ""
         if not text:
-            await update.message.reply_text("❌ Input tidak valid.", reply_markup=admin_keyboard())
+            await update.message.reply_text(
+                "❌ Input tidak valid. Ketik /cancel untuk batal."
+            )
+            waiting_revoke.add(uid)
             return
         ok, msg = await _do_revoke(text, context)
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard())
@@ -673,10 +669,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     user = update.effective_user
 
-    waiting_gift.discard(uid)
-    waiting_revoke.discard(uid)
-    waiting_restore.discard(uid)
-    temp_store.pop(uid, None)
+    # Reset SEMUA state apapun kondisinya
+    _clear_user_state(uid)
 
     upsert_user(uid, user.username, user.full_name)
     session = get_user_session(uid)
@@ -698,16 +692,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=main_keyboard(uid)
     )
+    return ConversationHandler.END  # paksa keluar dari conversation jika sedang di dalamnya
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    temp_store.pop(uid, None)
-    waiting_restore.discard(uid)
-    waiting_gift.discard(uid)
-    waiting_revoke.discard(uid)
+    _clear_user_state(uid)
     await update.message.reply_text(
-        "❌ *Dibatalkan.*",
+        "❌ *Dibatalkan.* Kembali ke menu utama.",
         parse_mode="Markdown",
         reply_markup=main_keyboard(uid)
     )
@@ -722,8 +714,8 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "⚠️ Format: `/revoke <user_id atau @username>`",
-            parse_mode="Markdown"
+            "⚠️ Format: /revoke <user_id atau @username>\n"
+            "Contoh: /revoke 123456789"
         )
         return
     ok, msg = await _do_revoke(args[0].strip(), context)
@@ -738,9 +730,8 @@ async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "⚠️ Format: `/gift <user_id atau @username> [days]`\n"
-            "Contoh: `/gift 123456789 30` atau `/gift @username`",
-            parse_mode="Markdown"
+            "⚠️ Format: /gift <user_id atau @username> [hari]\n"
+            "Contoh: /gift 123456789 30 atau /gift @username"
         )
         return
     target_str = args[0].strip()
@@ -754,7 +745,7 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_subscribed(uid):
         await update.message.reply_text(
-            "❌ Kamu belum berlangganan VIP.\n\nUntuk berlangganan VIP, silakan hubungi admin.",
+            "❌ Kamu belum berlangganan VIP.\n\nHubungi admin untuk berlangganan.",
             parse_mode="Markdown", reply_markup=main_keyboard(uid)
         )
         return ConversationHandler.END
@@ -764,15 +755,15 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Proses ini menghubungkan akun Telegram kamu ke bot.\n"
         "Ketik /cancel kapan saja untuk membatalkan.\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "*Langkah 1 dari 5 \u2014 API ID*\n\n"
-        "API ID adalah kode angka unik milik aplikasi Telegram buatanmu.\n\n"
-        "📌 *Cara mendapatkan API ID:*\n"
+        "*Langkah 1 dari 5 - API ID*\n\n"
+        "API ID adalah kode angka unik untuk aplikasi Telegram kamu.\n\n"
+        "📌 Cara mendapatkan API ID:\n"
         "1. Buka https://my.telegram.org di browser\n"
         "2. Login dengan nomor HP Telegram kamu\n"
         "3. Masukkan kode OTP yang dikirim ke Telegram\n"
-        "4. Klik *API development tools*\n"
-        "5. Isi form (nama & platform bebas), klik *Create application*\n"
-        "6. Salin angka di kolom *App api\_id*\n\n"
+        "4. Klik API development tools\n"
+        "5. Isi form (nama dan platform bebas diisi apa saja), lalu klik Create application\n"
+        "6. Salin angka di kolom App api id\n\n"
         "Kirim angka tersebut di sini:",
         parse_mode="Markdown"
     )
@@ -784,22 +775,22 @@ async def setup_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text.isdigit():
         await update.message.reply_text(
-            "❌ API ID harus berupa *angka saja*, bukan huruf.\n\n"
-            "Contoh yang benar: `12345678`\n\nCoba kirim ulang:",
-            parse_mode="Markdown"
+            "❌ API ID harus berupa angka saja.\n\n"
+            "Contoh yang benar: 12345678\n\n"
+            "Coba kirim ulang, atau /cancel untuk batal:"
         )
         return API_ID_STEP
     temp_store.setdefault(uid, {})["api_id"] = int(text)
     await update.message.reply_text(
         "✅ API ID tersimpan!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "*Langkah 2 dari 5 \u2014 API Hash*\n\n"
-        "API Hash adalah kode acak 32 karakter (campuran huruf & angka).\n\n"
-        "📌 *Cara mendapatkan API Hash:*\n"
-        "Di halaman yang sama (my.telegram.org \u2192 API development tools),\n"
-        "salin teks panjang di kolom *App api\_hash*\n\n"
-        "Contoh tampilan: `a1b2c3d4e5f6g7h8i9j0...` _(32 karakter)_\n\n"
-        "Kirim API Hash kamu di sini:",
+        "*Langkah 2 dari 5 - API Hash*\n\n"
+        "API Hash adalah kode acak 32 karakter (campuran huruf dan angka).\n\n"
+        "📌 Cara mendapatkan API Hash:\n"
+        "Di halaman yang sama (my.telegram.org > API development tools),\n"
+        "salin teks panjang di kolom App api hash.\n\n"
+        "Contoh tampilannya: a1b2c3d4e5f6... (32 karakter)\n\n"
+        "Kirim API Hash kamu di sini, atau /cancel untuk batal:",
         parse_mode="Markdown"
     )
     return API_HASH_STEP
@@ -810,24 +801,22 @@ async def setup_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if len(text) < 10:
         await update.message.reply_text(
-            "❌ API Hash sepertinya terlalu pendek.\n\n"
-            "API Hash seharusnya 32 karakter, campuran huruf dan angka.\n"
+            "❌ API Hash terlalu pendek.\n\n"
+            "API Hash seharusnya 32 karakter campuran huruf dan angka.\n"
             "Pastikan kamu menyalin seluruhnya dari my.telegram.org\n\n"
-            "Coba kirim ulang:",
-            parse_mode="Markdown"
+            "Coba kirim ulang, atau /cancel untuk batal:"
         )
         return API_HASH_STEP
     temp_store.setdefault(uid, {})["api_hash"] = text
     await update.message.reply_text(
         "✅ API Hash tersimpan!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "*Langkah 3 dari 5 \u2014 Nomor HP*\n\n"
+        "*Langkah 3 dari 5 - Nomor HP*\n\n"
         "Masukkan nomor HP yang terdaftar di akun Telegram kamu.\n\n"
-        "📌 *Format yang benar:*\n"
-        "\u2022 Awali dengan kode negara\n"
-        "\u2022 Indonesia: `+628xxxxxxxxxx`\n"
-        "\u2022 Contoh: `+6281234567890`\n\n"
-        "Kirim nomor HP kamu:",
+        "📌 Format yang benar:\n"
+        "Awali dengan kode negara, tanpa spasi atau tanda hubung.\n"
+        "Contoh untuk Indonesia: +6281234567890\n\n"
+        "Kirim nomor HP kamu, atau /cancel untuk batal:",
         parse_mode="Markdown"
     )
     return PHONE_STEP
@@ -847,13 +836,14 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📨 Kode OTP berhasil dikirim ke Telegram kamu!\n\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "*Langkah 4 dari 5 \u2014 Kode OTP*\n\n"
-            "Buka aplikasi Telegram kamu, cari pesan dari *Telegram* "
+            "*Langkah 4 dari 5 - Kode OTP*\n\n"
+            "Buka aplikasi Telegram kamu, cari pesan dari Telegram "
             "yang berisi 5 digit kode verifikasi.\n\n"
-            "📌 *Cara mengirim kode:*\n"
-            "Ketik kode dengan *spasi di antara setiap angka*\n\n"
-            "Contoh: jika kode kamu `12345`, kirim: `1 2 3 4 5`\n\n"
-            "_(Spasi wajib agar Telegram tidak mendeteksi sebagai aktivitas mencurigakan)_",
+            "📌 Cara mengirim kode:\n"
+            "Ketik kode dengan spasi di antara setiap angka.\n\n"
+            "Contoh: jika kode kamu 12345, kirim: 1 2 3 4 5\n\n"
+            "Spasi wajib dipakai agar Telegram tidak mendeteksinya sebagai aktivitas mencurigakan.\n\n"
+            "Kirim kode OTP kamu, atau /cancel untuk batal:",
             parse_mode="Markdown"
         )
         return CODE_STEP
@@ -861,12 +851,12 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
         temp_store.pop(uid, None)
         await update.message.reply_text(
-            f"❌ Gagal mengirim OTP: `{e}`\n\n"
+            f"❌ Gagal mengirim OTP: {e}\n\n"
             "Kemungkinan penyebab:\n"
-            "\u2022 Nomor HP salah format (harus pakai +62...)\n"
-            "\u2022 API ID atau API Hash salah\n\n"
+            "Nomor HP salah format (harus pakai +62...)\n"
+            "API ID atau API Hash salah\n\n"
             "Silakan /setup ulang dari awal.",
-            parse_mode="Markdown", reply_markup=main_keyboard(uid)
+            reply_markup=main_keyboard(uid)
         )
         return ConversationHandler.END
 
@@ -882,11 +872,11 @@ async def setup_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🔐 *Akun ini mengaktifkan verifikasi 2 langkah (2FA)*\n\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "*Langkah 5 dari 5 \u2014 Password 2FA*\n\n"
+            "*Langkah 5 dari 5 - Password 2FA*\n\n"
             "Masukkan password 2FA Telegram kamu.\n\n"
-            "📌 Ini adalah password yang kamu buat sendiri di:\n"
-            "Telegram \u2192 Pengaturan \u2192 Privasi & Keamanan \u2192 Verifikasi 2 Langkah\n\n"
-            "Kirim password kamu:",
+            "📌 Password ini adalah yang kamu buat sendiri di:\n"
+            "Telegram > Pengaturan > Privasi dan Keamanan > Verifikasi 2 Langkah\n\n"
+            "Kirim password kamu, atau /cancel untuk batal:",
             parse_mode="Markdown"
         )
         return PASSWORD_STEP
@@ -895,14 +885,13 @@ async def setup_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_store.pop(uid, None)
         await update.message.reply_text(
             "❌ Kode OTP salah atau sudah kadaluarsa.\n\n"
-            "Silakan /setup ulang untuk mendapatkan kode baru.",
-            parse_mode="Markdown"
+            "Silakan /setup ulang untuk mendapatkan kode baru."
         )
         return ConversationHandler.END
     except Exception as e:
         await client.disconnect()
         temp_store.pop(uid, None)
-        await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Terjadi error: {e}\n\nSilakan /setup ulang.")
         return ConversationHandler.END
     return await _finish_setup(update, uid, data, client)
 
@@ -918,8 +907,7 @@ async def setup_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
         temp_store.pop(uid, None)
         await update.message.reply_text(
-            f"❌ Password 2FA salah: `{e}`\nSilakan /setup ulang.",
-            parse_mode="Markdown"
+            f"❌ Password 2FA salah: {e}\n\nSilakan /setup ulang."
         )
         return ConversationHandler.END
     return await _finish_setup(update, uid, data, client)
@@ -932,7 +920,13 @@ async def _finish_setup(update, uid, data, client):
     temp_store.pop(uid, None)
     await update.message.reply_text(
         "✅ *Setup berhasil! Session kamu sudah aktif.*\n\n"
-        "Gunakan tombol *📖 Cara Penggunaan* di menu utama untuk panduan lengkap fitur VIP.",
+        "━━━━━━━━━━━━━━━━━\n"
+        "⚠️ *PENTING: Jangan logout dari sesi ini!*\n\n"
+        "Bot bekerja menggunakan sesi login akun Telegram kamu yang sudah tersimpan. "
+        "Jika kamu logout dari perangkat tempat sesi ini dibuat (misalnya lewat menu "
+        "Pengaturan > Perangkat > Hapus sesi), maka fitur .dl dan .copy akan berhenti berfungsi "
+        "dan kamu perlu melakukan /setup ulang.\n\n"
+        "📖 Gunakan tombol *Cara Penggunaan* di menu utama untuk panduan lengkap.",
         parse_mode="Markdown",
         reply_markup=main_keyboard(uid)
     )
@@ -950,8 +944,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "💎 *Cara Berlangganan VIP*\n\n"
             "Untuk mendapatkan akses VIP, silakan hubungi admin secara langsung.\n\n"
-            "Admin akan mengaktifkan VIP kamu setelah konfirmasi pembayaran.\n\n"
-            f"👤 Hubungi Admin: tg://user?id={ADMIN_ID}",
+            "Admin akan mengaktifkan VIP kamu setelah konfirmasi pembayaran.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💬 Chat Admin", url=f"tg://user?id={ADMIN_ID}")],
@@ -968,7 +961,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await query.edit_message_text(
-            "📱 Gunakan /setup untuk mengatur session Telegram kamu.",
+            "📱 Ketik /setup untuk mengatur session Telegram kamu.",
             reply_markup=main_keyboard(uid)
         )
     elif data == "menu_guide":
@@ -987,9 +980,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=admin_keyboard()
         )
     elif data == "menu_back":
-        waiting_gift.discard(uid)
-        waiting_revoke.discard(uid)
-        waiting_restore.discard(uid)
+        _clear_user_state(uid)
         session = get_user_session(uid)
         client  = active_clients.get(uid)
         if session and client and client.is_connected():
@@ -1015,7 +1006,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid != ADMIN_ID: return
         waiting_restore.add(ADMIN_ID)
         await query.edit_message_text(
-            "📥 *Mode Restore Aktif*\n\nKirim file `.sql` hasil backup.\n_/cancel untuk batal._",
+            "📥 *Mode Restore Aktif*\n\n"
+            "Kirim file .sql hasil backup.\n"
+            "Ketik /cancel untuk batal.",
             parse_mode="Markdown"
         )
     elif data == "admin_gift":
@@ -1024,12 +1017,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🎁 *Gift VIP*\n\n"
             "Kirim target dalam format:\n"
-            "`<user_id> [days]` atau `@username [days]`\n\n"
-            "Contoh: `123456789 30` atau `@johndoe 30`\n"
-            "_(Default 30 hari jika tidak diisi)_\n\n"
-            "💡 *Tips:* Gunakan *user\_id* (angka) agar bisa gift tanpa user perlu\n"
-            "klik /start dulu. User\_id bisa dari @userinfobot atau @getidsbot.\n\n"
-            "_/cancel untuk batal._",
+            "user_id hari  atau  @username hari\n\n"
+            "Contoh: 123456789 30  atau  @johndoe 30\n"
+            "Jika hari tidak diisi, default 30 hari.\n\n"
+            "💡 Gunakan user ID (angka) agar bisa gift tanpa user perlu klik /start dulu.\n"
+            "User ID bisa didapat dari @userinfobot atau @getidsbot.\n\n"
+            "Ketik /cancel untuk batal.",
             parse_mode="Markdown"
         )
     elif data == "admin_revoke":
@@ -1037,16 +1030,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting_revoke.add(ADMIN_ID)
         await query.edit_message_text(
             "🚫 *Revoke VIP*\n\n"
-            "Fitur ini akan *mencabut* langganan VIP milik pengguna.\n"
-            "Pengguna tidak akan bisa menggunakan fitur `.dl` dan `.copy` lagi.\n\n"
+            "Fitur ini akan mencabut langganan VIP milik pengguna.\n"
+            "Pengguna tidak bisa menggunakan fitur .dl dan .copy lagi setelah ini.\n\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "*Cara menggunakan:*\n"
-            "Kirim user\_id atau @username pengguna yang ingin dicabut VIP-nya.\n\n"
+            "Kirim user ID atau @username pengguna yang ingin dicabut VIP-nya.\n\n"
             "Contoh:\n"
-            "\u2022 `123456789` _(user\_id, paling disarankan)_\n"
-            "\u2022 `@johndoe` _(username, harus sudah pernah /start)_\n\n"
-            "💡 *Tips:* Revoke by user\_id selalu berhasil walau user belum /start.\n\n"
-            "_/cancel untuk batal._",
+            "123456789  (user ID, paling disarankan)\n"
+            "@johndoe  (username, harus sudah pernah /start)\n\n"
+            "Ketik /cancel untuk batal.",
             parse_mode="Markdown"
         )
 
@@ -1126,26 +1117,33 @@ def main():
             PASSWORD_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_password)],
         },
         fallbacks=[
+            # /cancel dan /start SELALU bisa keluar dari conversation di state manapun
             CommandHandler("cancel", cmd_cancel),
             CommandHandler("start",  cmd_start),
         ],
         allow_reentry=True,
     )
 
+    # group=0: /start dan /cancel — prioritas tertinggi, selalu diproses duluan
+    app.add_handler(CommandHandler("start",  cmd_start),  group=0)
+    app.add_handler(CommandHandler("cancel", cmd_cancel), group=0)
+
+    # group=1: ConversationHandler setup
+    app.add_handler(setup_conv, group=1)
+
+    # group=2: admin message handler — diproses setelah /cancel dan conversation
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & filters.User(ADMIN_ID),
             admin_message_handler
         ),
-        group=0
+        group=2
     )
 
-    app.add_handler(setup_conv, group=1)
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("revoke", cmd_revoke))
-    app.add_handler(CommandHandler("gift",   cmd_gift))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    # group=3: command lainnya
+    app.add_handler(CommandHandler("revoke", cmd_revoke), group=3)
+    app.add_handler(CommandHandler("gift",   cmd_gift),   group=3)
+    app.add_handler(CallbackQueryHandler(callback_handler), group=3)
 
     print("🤖 Rams VIP Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
