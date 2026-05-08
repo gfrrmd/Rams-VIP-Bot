@@ -1,59 +1,118 @@
 # ⚡ Rams VIP Bot
 
-Telegram VIP Bot dengan fitur download media dari channel restricted, manajemen session Telethon, dan sistem langganan VIP manual via admin.
+> Telegram VIP Bot yang menggabungkan **bot biasa** (python-telegram-bot) dan **userbot** (Telethon) untuk mengunduh konten dari channel restricted, lengkap dengan sistem langganan VIP manual via admin.
 
-## ✨ Fitur Utama
+---
 
-- **`.dl`** — Reply pesan lalu ketik `.dl` untuk forward/download media ke Saved Messages
-- **`.copy <link>`** — Download/copy konten dari channel restricted (teks, foto, video, dokumen, stiker) ke Saved Messages
-- **Sistem VIP Manual** — Member berlangganan dengan menghubungi admin, admin yang mengaktifkan VIP
-- **Gift VIP** — Admin bisa gift VIP ke user via ID atau @username
-- **Revoke VIP** — Admin bisa mencabut VIP member kapan saja
-- **Backup & Restore DB** — Admin bisa backup dan restore database via bot
+## ✨ Fitur
 
-## 🚀 Cara Deploy (Railway)
+### 🤖 Bot (Admin)
+- **Manajemen VIP** — Aktifkan, gift, atau cabut akses VIP member
+- **Backup & Restore DB** — Kirim dan pulihkan database langsung via bot
+- **Sistem Session** — Simpan & kelola session Telethon per user di database
 
-1. Fork/clone repo ini
+### 👤 Userbot (Member VIP)
+- **`.dl`** — Reply pesan → forward/download media ke Saved Messages
+- **`.copy <link>`** — Salin konten dari channel restricted (teks, foto, video, dokumen, stiker) ke Saved Messages
+
+### 🗃️ Database (PostgreSQL)
+- Menyimpan data member VIP, session Telethon, dan log aktivitas
+- Support backup & restore via file `.sql`
+
+---
+
+## 🛠️ Tech Stack
+
+| Teknologi | Versi | Kegunaan |
+|---|---|---|
+| `python-telegram-bot` | 20.7 | Bot Telegram utama |
+| `Telethon` | 1.36.0 | Userbot untuk channel restricted |
+| `psycopg2-binary` | 2.9.9 | Koneksi ke PostgreSQL |
+| PostgreSQL | — | Database utama |
+| Railway | — | Hosting & deployment |
+
+---
+
+## 🚀 Deploy ke Railway
+
+1. **Fork** repo ini ke akun GitHub kamu
 2. Buat project baru di [Railway](https://railway.app)
-3. Tambahkan PostgreSQL database
-4. Set environment variables:
-   - `BOT_TOKEN` — Token bot dari @BotFather
-   - `ADMIN_ID` — Telegram user ID admin
-   - `DATABASE_URL` — Otomatis dari Railway PostgreSQL
-5. Deploy!
+3. Tambahkan **PostgreSQL** sebagai plugin database
+4. Set **environment variables** berikut:
+
+```env
+BOT_TOKEN=your_bot_token_from_botfather
+ADMIN_ID=your_telegram_user_id
+DATABASE_URL=postgresql://...  # otomatis dari Railway PostgreSQL
+```
+
+5. Railway akan otomatis mendeteksi `Procfile` dan langsung deploy
+
+---
+
+## ⚙️ Environment Variables
+
+| Variable | Deskripsi |
+|---|---|
+| `BOT_TOKEN` | Token bot dari [@BotFather](https://t.me/BotFather) |
+| `ADMIN_ID` | Telegram User ID admin (angka) |
+| `DATABASE_URL` | Connection string PostgreSQL (auto dari Railway) |
+
+---
 
 ## 📋 Perintah Admin
 
 | Perintah | Fungsi |
 |---|---|
-| `/gift <id/@username> [days]` | Berikan VIP ke user |
-| `/revoke <id/@username>` | Cabut VIP member |
-| Menu Admin → Gift VIP | Berikan VIP via tombol |
-| Menu Admin → Revoke VIP | Cabut VIP via tombol |
-| Menu Admin → Backup DB | Backup database |
-| Menu Admin → Restore DB | Restore database |
+| `/gift <id/@username> [days]` | Berikan VIP ke user (default 30 hari) |
+| `/revoke <id/@username>` | Cabut akses VIP member |
+| Menu → Gift VIP | Gift VIP via inline button |
+| Menu → Revoke VIP | Cabut VIP via inline button |
+| Menu → Backup DB | Unduh backup database |
+| Menu → Restore DB | Pulihkan database dari file |
 
-## 📋 Perintah User (Userbot via Telethon)
+## 📋 Perintah User VIP (Userbot)
 
 | Perintah | Fungsi |
 |---|---|
 | `.dl` | Download/forward media yang di-reply ke Saved Messages |
-| `.copy <link>` | Copy konten channel restricted ke Saved Messages |
+| `.copy <link>` | Salin konten channel restricted ke Saved Messages |
 
-## ⚙️ Environment Variables
+---
+
+## 📝 Alur Berlangganan VIP
 
 ```
-BOT_TOKEN=your_bot_token
-ADMIN_ID=your_telegram_id
-DATABASE_URL=postgresql://...
+User → Hubungi Admin → Admin aktifkan VIP → User login session → Fitur aktif
 ```
 
-## 📝 Cara Berlangganan VIP
+Tidak ada sistem pembayaran otomatis. Admin mengonfirmasi dan mengaktifkan VIP secara manual.
 
-User harus menghubungi admin secara manual. Admin akan mengaktifkan VIP setelah konfirmasi. Tidak ada sistem pembayaran otomatis.
+---
 
-## ⚠️ Catatan
+## ⚠️ Catatan Penting
 
-- Fitur `.copy` menggunakan akun Telegram user (Telethon userbot), bukan bot biasa
-- Forward diutamakan untuk kecepatan, download dipakai sebagai fallback untuk konten restricted
-- Media yang didukung: teks, foto, video, dokumen, stiker (webp/tgs/webm), audio
+- Fitur `.copy` menggunakan **akun Telegram asli** (Telethon userbot), bukan bot
+- Forward diutamakan untuk kecepatan; download dipakai sebagai fallback untuk konten restricted
+- Media yang didukung: **teks, foto, video, dokumen, stiker** (`.webp` / `.tgs` / `.webm`), audio
+- Jangan bagikan `session string` ke siapapun — ini setara akses penuh ke akun Telegram
+
+---
+
+## 📁 Struktur File
+
+```
+Rams-VIP-Bot/
+├── main.py          # Logic utama bot & userbot
+├── database.py      # Fungsi database (PostgreSQL)
+├── requirements.txt # Dependencies Python
+├── Procfile         # Entry point Railway
+├── railway.json     # Konfigurasi Railway
+└── runtime.txt      # Versi Python
+```
+
+---
+
+<div align="center">
+  Made with ❤️ by <a href="https://github.com/gfrrmd">gfrrmd</a>
+</div>
