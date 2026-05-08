@@ -12,8 +12,7 @@ from telegram.ext import (
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMediaSticker
-from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
 from database import (
     init_db, upsert_user,
@@ -35,10 +34,10 @@ SYSTEM_LANG_CODE = "id-ID"
 API_ID_STEP, API_HASH_STEP, PHONE_STEP, CODE_STEP, PASSWORD_STEP = range(5)
 
 waiting_restore = set()
-waiting_gift    = set()  # set of ADMIN_ID waiting for gift target
-waiting_revoke  = set()  # set of ADMIN_ID waiting for revoke target
+waiting_gift    = set()
+waiting_revoke  = set()
 
-temp_store   = {}
+temp_store     = {}
 active_clients = {}
 
 # Regex untuk parse link Telegram channel/post
@@ -78,6 +77,18 @@ def is_view_once(message):
 def is_no_forward(message):
     """Cek apakah pesan memiliki flag noforwards (protected content)."""
     return bool(getattr(message, "noforwards", False))
+
+
+def is_sticker_doc(doc):
+    """Deteksi stiker dari atribut dokumen (tanpa MessageMediaSticker)."""
+    if doc is None:
+        return False
+    mime = getattr(doc, "mime_type", "") or ""
+    has_stickerset = any(
+        getattr(attr, "stickerset", None) is not None
+        for attr in getattr(doc, "attributes", [])
+    )
+    return has_stickerset or "sticker" in mime
 
 
 def main_keyboard(uid):
@@ -191,10 +202,10 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
             return
 
         # Tentukan channel dan message ID
-        username_part  = m.group("username")
-        msg_id_part    = m.group("msg_id")
+        username_part   = m.group("username")
+        msg_id_part     = m.group("msg_id")
         channel_id_part = m.group("channel_id")
-        msg_id2_part   = m.group("msg_id2")
+        msg_id2_part    = m.group("msg_id2")
 
         if username_part and msg_id_part:
             channel_ref = username_part
@@ -220,7 +231,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
 
         await status_msg.delete()
 
-        # ── Proses berdasarkan tipe konten ─────────────────────────
+        # ── Proses berdasarkan tipe konten ──────────────────────────
         # 1. Teks saja (tanpa media)
         if not msg.media:
             text_content = msg.text or msg.message or ""
@@ -250,21 +261,14 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                     await client.send_file("me", file=file_obj, caption=caption)
 
             elif isinstance(msg.media, MessageMediaDocument):
-                doc = msg.media.document
-                # Cek apakah stiker
-                is_sticker = any(
-                    getattr(attr, "stickerset", None) is not None
-                    for attr in doc.attributes
-                )
-                # Cek apakah animated sticker (.tgs) atau video sticker
+                doc  = msg.media.document
                 mime = getattr(doc, "mime_type", "") or ""
 
-                if is_sticker or "sticker" in mime:
+                if is_sticker_doc(doc):
                     # Stiker: download dan kirim sebagai stiker
                     media_bytes = await client.download_media(msg.media, bytes)
                     if media_bytes:
                         file_obj = io.BytesIO(media_bytes)
-                        # Tentukan ekstensi berdasarkan mime
                         if "webp" in mime:
                             file_obj.name = "sticker.webp"
                         elif "tgsticker" in mime or "application/x-tgsticker" in mime:
@@ -281,7 +285,6 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                         if hasattr(attr, "file_name") and attr.file_name:
                             fname = attr.file_name
                             break
-                    # Beri ekstensi dari mime kalau tidak ada
                     if "." not in fname:
                         ext_map = {
                             "video/mp4": ".mp4",
@@ -302,7 +305,7 @@ async def start_client_for_user(user_id, api_id, api_hash, string_session):
                             force_document=False
                         )
             else:
-                # Media lain (voice, gif, etc.) — coba forward, kalau gagal skip
+                # Media lain (voice, gif, dll) — coba forward, kalau gagal skip
                 try:
                     await client.forward_messages("me", msg)
                 except Exception:
@@ -457,7 +460,6 @@ def _resolve_target(target_str: str):
     """Resolve user_id dari ID angka atau @username."""
     if target_str.lstrip("@").isdigit() and not target_str.startswith("@"):
         return int(target_str)
-    # Bisa berupa @username atau username biasa
     return get_user_by_username(target_str)
 
 
