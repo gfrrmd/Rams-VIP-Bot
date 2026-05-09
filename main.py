@@ -980,14 +980,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if data == "menu_fitur":
-    await query.edit_message_text(
-        FITUR_VIP_TEXT,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💎 Beli VIP", callback_data="menu_beli")],
-            [InlineKeyboardButton("🔙 Kembali", callback_data="menu_back")],
-        ])
-    )
+            await query.edit_message_text(
+                FITUR_VIP_TEXT,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 Beli VIP", callback_data="menu_beli")],
+                    [InlineKeyboardButton("🔙 Kembali", callback_data="menu_back")],
+                ])
+            )
 
         elif data == "menu_beli":
             await query.edit_message_text(
