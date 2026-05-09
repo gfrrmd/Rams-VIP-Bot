@@ -30,7 +30,7 @@ BOT_TOKEN   = os.environ["BOT_TOKEN"]
 ADMIN_ID    = int(os.environ["ADMIN_ID"])
 
 DEVICE_MODEL     = "iPhone 17 Pro Max"
-SYSTEM_VERSION   = "iOS 18.3.2"
+SYSTEM_VERSION   = "iOS 26.4"
 APP_VERSION      = "11.4.1"
 LANG_CODE        = "id"
 SYSTEM_LANG_CODE = "id-ID"
@@ -148,12 +148,12 @@ def main_keyboard(uid):
     rows = [
         [InlineKeyboardButton("⚙️ Setup Session", callback_data="menu_setup")],
         [
+            InlineKeyboardButton("✨ Fitur VIP", callback_data="menu_fitur"),
             InlineKeyboardButton("💎 Beli VIP", callback_data="menu_beli"),
-            InlineKeyboardButton("⌛️ Status Langganan", callback_data="menu_subscription"),
         ],
         [
+            InlineKeyboardButton("⌛️ Status Langganan", callback_data="menu_subscription"),
             InlineKeyboardButton("📖 Cara Penggunaan", callback_data="menu_guide"),
-            InlineKeyboardButton("✨ Fitur VIP", callback_data="menu_fitur"),
         ]
     ]
     if uid == ADMIN_ID:
@@ -178,11 +178,11 @@ def admin_keyboard():
 FITUR_VIP_TEXT = (
     "✨ *Fitur VIP Rams Bot — Langsung Kamu Bisa Gunakan*\n\n"
     "Pakai bot ini, kamu bisa:\n\n"
-    "📸 *Download View-Once (.dl)*\n"
+    "📸 *Download Media Timer/View-Once (.dl)*\n"
     "Simpan foto atau video timer yang hanya bisa dilihat sekali langsung ke akun kamu. "
-    "Reply media → ketik `.dl` → langsung dikirim ke Saved Messages.\n\n"
-    "📣 *Download Konten dari Channel/Grup (.copy)*\n"
-    "Ambil foto, video, dokumen, atau teks dari channel/grup yang tidak bisa di-forward. "
+    "Reply media → ketik `.dl` → langsung tersimpan ke Saved Messages.\n\n"
+    "📣 *Download Konten dari Channel/Grup Private (.copy)*\n"
+    "Ambil foto, video, dokumen, atau teks dari channel/grup yang tidak bisa di-forward/simpan. "
     "Kirim `.copy <link>` → konten langsung dikirim ke kamu.\n\n"
     "✅ *Bypass Batas No-Forward*\n"
     "Akses media dari channel yang blokir fitur forward, tanpa perlu screenshot.\n\n"
@@ -816,9 +816,9 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Login dengan nomor HP Telegram kamu\n"
         "3. Masukkan kode OTP yang dikirim ke Telegram\n"
         "4. Klik API development tools\n"
-        "5. Isi form lalu klik Create application\n"
-        "6. Salin angka di kolom App api id\n\n"
-        "Kirim angka tersebut di sini:",
+        "5. Isi *App title* dan *Short Name* bebas, untuk bagian Description kosongkan. Lalu klik Create application\n"
+        "6. Salin dan simpan *APP_ID* dan *API_HASH*.\n\n"
+        "Kirim angka dari *API_ID* tersebut di sini:",
         parse_mode="Markdown"
     )
     return API_ID_STEP
@@ -839,7 +839,7 @@ async def setup_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Langkah 2 dari 5 - API Hash*\n\n"
         "API Hash adalah kode acak 32 karakter (campuran huruf dan angka).\n\n"
         "📌 Cara mendapatkan API Hash:\n"
-        "Di halaman yang sama (my.telegram.org), salin teks panjang di kolom App api hash.\n"
+        "Di halaman yang sama (my.telegram.org), salin teks panjang di kolom App api hash yang kamu simpan tadi.\n"
         "Contoh: a1b2c3d4e5f6... (32 karakter)\n\n"
         "Kirim API Hash kamu di sini, atau /cancel untuk batal:",
         parse_mode="Markdown"
