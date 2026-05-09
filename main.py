@@ -146,6 +146,7 @@ async def stop_client_for_user(user_id: int):
 
 def main_keyboard(uid):
     rows = [
+        [InlineKeyboardButton("✨ Fitur VIP", callback_data="menu_fitur")],
         [InlineKeyboardButton("⚙️ Setup Session", callback_data="menu_setup")],
         [
             InlineKeyboardButton("💎 Beli VIP", callback_data="menu_beli"),
@@ -171,6 +172,26 @@ def admin_keyboard():
         [InlineKeyboardButton("🔙 Kembali", callback_data="menu_back")],
     ])
 
+
+FITUR_VIP_TEXT = (
+    "✨ *Fitur VIP Rams Bot — Langsung Kamu Bisa Gunakan*\n\n"
+    "Pakai bot ini, kamu bisa:\n\n"
+    "📸 *Download View-Once (.dl)*\n"
+    "Simpan foto atau video timer yang hanya bisa dilihat sekali langsung ke akun kamu. "
+    "Reply media → ketik `.dl` → langsung dikirim ke Saved Messages.\n\n"
+    "📣 *Download Konten dari Channel/Grup (.copy)*\n"
+    "Ambil foto, video, dokumen, atau teks dari channel/grup yang tidak bisa di-forward. "
+    "Kirim `.copy <link>` → konten langsung dikirim ke kamu.\n\n"
+    "✅ *Bypass Batas No-Forward*\n"
+    "Akses media dari channel yang blokir fitur forward, tanpa perlu screenshot.\n\n"
+    "✅ *Support Semua Format*\n"
+    "Bisa untuk foto, video, GIF, audio, stiker, dan dokumen.\n\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "💡 *Cara Mulai:*\n"
+    "1. Beli VIP lewat tombol di bawah\n"
+    "2. Jalankan /setup untuk setup session\n"
+    "3. Langsung pakai `.dl` atau `.copy` di chat manapun"
+)
 
 GUIDE_TEXT = (
     "📖 *Panduan Penggunaan Rams VIP Bot*\n\n"
@@ -958,7 +979,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     try:
-        if data == "menu_beli":
+        if data == "menu_fitur":
+    await query.edit_message_text(
+        FITUR_VIP_TEXT,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 Beli VIP", callback_data="menu_beli")],
+            [InlineKeyboardButton("🔙 Kembali", callback_data="menu_back")],
+        ])
+    )
+
+        elif data == "menu_beli":
             await query.edit_message_text(
                 "💎 *Cara Berlangganan VIP*\n\n"
                 "Untuk mendapatkan akses VIP, silakan hubungi admin secara langsung.\n\n"
