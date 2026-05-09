@@ -146,13 +146,15 @@ async def stop_client_for_user(user_id: int):
 
 def main_keyboard(uid):
     rows = [
-        [InlineKeyboardButton("✨ Fitur VIP", callback_data="menu_fitur")],
         [InlineKeyboardButton("⚙️ Setup Session", callback_data="menu_setup")],
         [
             InlineKeyboardButton("💎 Beli VIP", callback_data="menu_beli"),
             InlineKeyboardButton("⌛️ Status Langganan", callback_data="menu_subscription"),
         ],
-        [InlineKeyboardButton("📖 Cara Penggunaan", callback_data="menu_guide")],
+        [
+            InlineKeyboardButton("📖 Cara Penggunaan", callback_data="menu_guide"),
+            InlineKeyboardButton("✨ Fitur VIP", callback_data="menu_fitur"),
+        ]
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton("👤 Menu Admin", callback_data="menu_admin")])
